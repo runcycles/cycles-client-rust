@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.1] - 2026-03-31
+
+### Fixed
+
+- README version reference (was 0.1, now 0.2)
+- Outdated rustdoc on `with_cycles()` referencing `ReservationGuard` instead of `GuardContext`
+- CI: MSRV bumped from 1.75 to 1.88 (transitive deps require edition 2024)
+- CI: clippy `map_or` → `is_none_or` for Rust 1.94+ stable
+
 ## [0.2.0] - 2026-03-31
 
 ### Added
