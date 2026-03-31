@@ -1,0 +1,33 @@
+[package]
+name = "runcycles"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+description = "Rust client for the Cycles budget authority protocol"
+repository = "https://github.com/runcycles/cycles-client-rust"
+keywords = ["cycles", "budget", "api-client", "agent", "llm"]
+categories = ["api-bindings", "asynchronous"]
+
+[features]
+default = ["rustls-tls"]
+blocking = ["tokio/rt"]
+rustls-tls = ["reqwest/rustls-tls"]
+native-tls = ["reqwest/native-tls"]
+
+[dependencies]
+bon = "3"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["time", "sync", "macros"] }
+tokio-util = "0.7"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+pretty_assertions = "1"
+proptest = "1"
+tokio = { version = "1", features = ["full", "test-util"] }
+wiremock = "0.6"
