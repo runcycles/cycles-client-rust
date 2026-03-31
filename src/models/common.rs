@@ -214,6 +214,10 @@ mod tests {
         let b = Amount::tokens(100);
         assert_eq!(b.unit, Unit::Tokens);
         assert_eq!(b.amount, 100);
+
+        let c = Amount::credits(50);
+        assert_eq!(c.unit, Unit::Credits);
+        assert_eq!(c.amount, 50);
     }
 
     #[test]

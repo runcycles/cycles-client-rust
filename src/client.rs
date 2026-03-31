@@ -363,7 +363,7 @@ impl CyclesClient {
         resp: reqwest::Response,
         headers: &HeaderMap,
     ) -> Error {
-        let request_id = headers
+        let header_request_id = headers
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
             .map(String::from);
@@ -383,16 +383,27 @@ impl CyclesClient {
             .as_ref()
             .and_then(|b| b.details.clone());
 
-        // Classify specific error types
-        if status == 409 {
-            if let Some(ErrorCode::BudgetExceeded) = error_code {
-                return Error::BudgetExceeded {
-                    message,
-                    affected_scopes: vec![],
-                    retry_after: None,
-                    request_id,
-                };
-            }
+        // Prefer request_id from body, fall back to header
+        let request_id = body
+            .as_ref()
+            .and_then(|b| b.request_id.clone())
+            .or(header_request_id);
+
+        // Classify budget-related 409 errors
+        if status == 409
+            && matches!(
+                error_code,
+                Some(ErrorCode::BudgetExceeded)
+                    | Some(ErrorCode::OverdraftLimitExceeded)
+                    | Some(ErrorCode::DebtOutstanding)
+            )
+        {
+            return Error::BudgetExceeded {
+                message,
+                affected_scopes: vec![],
+                retry_after: None,
+                request_id,
+            };
         }
 
         Error::Api {

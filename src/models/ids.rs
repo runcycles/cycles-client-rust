@@ -101,4 +101,15 @@ mod tests {
         let id2: ReservationId = String::from("rsv_def").into();
         assert_eq!(id2.as_str(), "rsv_def");
     }
+
+    #[test]
+    fn into_inner() {
+        let id = ReservationId::new("rsv_xyz");
+        let inner: String = id.into_inner();
+        assert_eq!(inner, "rsv_xyz");
+
+        let ek = EventId::new("evt_123");
+        let inner2: String = ek.into_inner();
+        assert_eq!(inner2, "evt_123");
+    }
 }

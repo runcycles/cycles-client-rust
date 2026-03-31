@@ -55,6 +55,7 @@ use crate::models::{Caps, Decision, ReservationId};
 /// release is attempted via `tokio::spawn`.
 #[must_use = "reservation must be committed or released; will auto-release on drop"]
 pub struct ReservationGuard {
+    // Note: Debug is implemented manually below because JoinHandle doesn't impl Debug nicely.
     client: CyclesClient,
     id: ReservationId,
     decision: Decision,
@@ -181,6 +182,16 @@ impl Drop for ReservationGuard {
                 });
             }
         }
+    }
+}
+
+impl std::fmt::Debug for ReservationGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReservationGuard")
+            .field("id", &self.id)
+            .field("decision", &self.decision)
+            .field("finalized", &self.finalized)
+            .finish()
     }
 }
 
