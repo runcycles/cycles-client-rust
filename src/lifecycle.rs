@@ -40,9 +40,9 @@ use std::future::Future;
 
 use crate::client::CyclesClient;
 use crate::error::Error;
-use crate::models::request::{CommitRequest, ReservationCreateRequest};
 use crate::models::common::{Action, Amount, CyclesMetrics, Subject};
 use crate::models::enums::CommitOveragePolicy;
+use crate::models::request::{CommitRequest, ReservationCreateRequest};
 
 /// Snapshot of guard data passed to the `with_cycles` closure.
 ///

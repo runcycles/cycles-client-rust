@@ -180,7 +180,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let client = CyclesClient::builder("key", &server.uri()).build();
+        let client = CyclesClient::builder("key", server.uri()).build();
 
         Mock::given(method("POST"))
             .and(path("/v1/reservations/rsv_ok/commit"))
@@ -208,7 +208,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let client = CyclesClient::builder("key", &server.uri()).build();
+        let client = CyclesClient::builder("key", server.uri()).build();
 
         Mock::given(method("POST"))
             .and(path("/v1/reservations/rsv_nr/commit"))
@@ -239,7 +239,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let client = CyclesClient::builder("key", &server.uri()).build();
+        let client = CyclesClient::builder("key", server.uri()).build();
 
         Mock::given(method("POST"))
             .and(path("/v1/reservations/rsv_ex/commit"))

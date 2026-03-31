@@ -9,7 +9,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[tokio::test]
 async fn retry_engine_retries_on_server_error() {
     let server = MockServer::start().await;
-    let client = CyclesClient::builder("key", &server.uri())
+    let client = CyclesClient::builder("key", server.uri())
         .retry_enabled(true)
         .retry_max_attempts(3)
         .build();

@@ -80,10 +80,7 @@ impl std::fmt::Debug for CyclesClient {
 
 impl CyclesClient {
     /// Create a new client builder.
-    pub fn builder(
-        api_key: impl Into<String>,
-        base_url: impl Into<String>,
-    ) -> CyclesClientBuilder {
+    pub fn builder(api_key: impl Into<String>, base_url: impl Into<String>) -> CyclesClientBuilder {
         CyclesClientBuilder::new(api_key, base_url)
     }
 
@@ -93,10 +90,7 @@ impl CyclesClient {
     }
 
     /// Internal constructor used by the builder.
-    pub(crate) fn from_builder(
-        config: CyclesConfig,
-        http_client: Option<reqwest::Client>,
-    ) -> Self {
+    pub(crate) fn from_builder(config: CyclesConfig, http_client: Option<reqwest::Client>) -> Self {
         let http = http_client.unwrap_or_else(|| {
             reqwest::Client::builder()
                 .connect_timeout(config.connect_timeout)
@@ -124,10 +118,7 @@ impl CyclesClient {
     ///
     /// Returns `Err(Error::BudgetExceeded)` if the decision is `Deny`.
     #[tracing::instrument(skip(self, req), fields(cycles.reservation_id, cycles.decision))]
-    pub async fn reserve(
-        &self,
-        req: ReservationCreateRequest,
-    ) -> Result<ReservationGuard, Error> {
+    pub async fn reserve(&self, req: ReservationCreateRequest) -> Result<ReservationGuard, Error> {
         validation::validate_subject(&req.subject)?;
         validation::validate_ttl_ms(req.ttl_ms)?;
         validation::validate_grace_period_ms(req.grace_period_ms)?;
@@ -174,12 +165,8 @@ impl CyclesClient {
         &self,
         req: &ReservationCreateRequest,
     ) -> Result<ReservationCreateResponse, Error> {
-        self.post_json(
-            RESERVATIONS_PATH,
-            req,
-            Some(req.idempotency_key.as_str()),
-        )
-        .await
+        self.post_json(RESERVATIONS_PATH, req, Some(req.idempotency_key.as_str()))
+            .await
     }
 
     /// Create a reservation and return the response with metadata.
@@ -187,12 +174,8 @@ impl CyclesClient {
         &self,
         req: &ReservationCreateRequest,
     ) -> Result<ApiResponse<ReservationCreateResponse>, Error> {
-        self.post_json_with_metadata(
-            RESERVATIONS_PATH,
-            req,
-            Some(req.idempotency_key.as_str()),
-        )
-        .await
+        self.post_json_with_metadata(RESERVATIONS_PATH, req, Some(req.idempotency_key.as_str()))
+            .await
     }
 
     /// Commit actual spend against a reservation.
@@ -252,19 +235,13 @@ impl CyclesClient {
     }
 
     /// Get details of a single reservation.
-    pub async fn get_reservation(
-        &self,
-        id: &ReservationId,
-    ) -> Result<ReservationDetail, Error> {
+    pub async fn get_reservation(&self, id: &ReservationId) -> Result<ReservationDetail, Error> {
         let path = format!("{RESERVATIONS_PATH}/{}", id.as_str());
         self.get_json::<(), _>(&path, None).await
     }
 
     /// Query budget balances for scopes.
-    pub async fn get_balances(
-        &self,
-        params: &BalanceParams,
-    ) -> Result<BalanceResponse, Error> {
+    pub async fn get_balances(&self, params: &BalanceParams) -> Result<BalanceResponse, Error> {
         if !params.has_filter() {
             return Err(Error::Validation(
                 "getBalances requires at least one subject filter".to_string(),
@@ -281,7 +258,9 @@ impl CyclesClient {
         body: &B,
         idempotency_key: Option<&str>,
     ) -> Result<R, Error> {
-        let resp: ApiResponse<R> = self.post_json_with_metadata(path, body, idempotency_key).await?;
+        let resp: ApiResponse<R> = self
+            .post_json_with_metadata(path, body, idempotency_key)
+            .await?;
         Ok(resp.into_inner())
     }
 
@@ -318,12 +297,15 @@ impl CyclesClient {
         let status = resp.status().as_u16();
 
         if (200..300).contains(&status) {
-            let data: R = resp.json().await.map_err(|e| {
-                Error::Deserialization(serde::de::Error::custom(e.to_string()))
-            })?;
+            let data: R = resp
+                .json()
+                .await
+                .map_err(|e| Error::Deserialization(serde::de::Error::custom(e.to_string())))?;
             Ok(ApiResponse::from_response(data, &response_headers))
         } else {
-            Err(self.parse_error_response(status, resp, &response_headers).await)
+            Err(self
+                .parse_error_response(status, resp, &response_headers)
+                .await)
         }
     }
 
@@ -349,11 +331,13 @@ impl CyclesClient {
         let status = resp.status().as_u16();
 
         if (200..300).contains(&status) {
-            resp.json().await.map_err(|e| {
-                Error::Deserialization(serde::de::Error::custom(e.to_string()))
-            })
+            resp.json()
+                .await
+                .map_err(|e| Error::Deserialization(serde::de::Error::custom(e.to_string())))
         } else {
-            Err(self.parse_error_response(status, resp, &response_headers).await)
+            Err(self
+                .parse_error_response(status, resp, &response_headers)
+                .await)
         }
     }
 
@@ -379,9 +363,7 @@ impl CyclesClient {
             .as_ref()
             .and_then(|b| serde_json::from_value(serde_json::Value::String(b.error.clone())).ok());
 
-        let details = body
-            .as_ref()
-            .and_then(|b| b.details.clone());
+        let details = body.as_ref().and_then(|b| b.details.clone());
 
         // Prefer request_id from body, fall back to header
         let request_id = body
@@ -417,11 +399,8 @@ impl CyclesClient {
     }
 }
 
-// Ensure CyclesClient is Send + Sync.
-#[cfg(test)]
-const _: () = {
+// Compile-time assertion: CyclesClient is Send + Sync.
+const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
-    fn check() {
-        assert_send_sync::<CyclesClient>();
-    }
+    assert_send_sync::<CyclesClient>();
 };

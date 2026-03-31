@@ -50,11 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
         |ctx| async move {
             // If server returns caps, respect max_tokens
-            let max_tokens = ctx
-                .caps
-                .as_ref()
-                .and_then(|c| c.max_tokens)
-                .unwrap_or(2000);
+            let max_tokens = ctx.caps.as_ref().and_then(|c| c.max_tokens).unwrap_or(2000);
 
             let (reply, inp, out) = call_llm("Write a poem", max_tokens).await;
             println!("Used {inp} input + {out} output tokens");

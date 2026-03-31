@@ -50,10 +50,12 @@ impl CyclesConfig {
 
     /// Create a new config from environment variables with a custom prefix.
     pub fn from_env_with_prefix(prefix: &str) -> Result<Self, Error> {
-        let base_url = std::env::var(format!("{prefix}BASE_URL"))
-            .map_err(|_| Error::Config(format!("{prefix}BASE_URL environment variable is required")))?;
-        let api_key = std::env::var(format!("{prefix}API_KEY"))
-            .map_err(|_| Error::Config(format!("{prefix}API_KEY environment variable is required")))?;
+        let base_url = std::env::var(format!("{prefix}BASE_URL")).map_err(|_| {
+            Error::Config(format!("{prefix}BASE_URL environment variable is required"))
+        })?;
+        let api_key = std::env::var(format!("{prefix}API_KEY")).map_err(|_| {
+            Error::Config(format!("{prefix}API_KEY environment variable is required"))
+        })?;
 
         let env_opt = |name: &str| std::env::var(format!("{prefix}{name}")).ok();
         let env_duration_ms = |name: &str, default_ms: u64| -> Duration {
@@ -83,8 +85,7 @@ impl CyclesConfig {
             toolset: env_opt("TOOLSET"),
             connect_timeout: env_duration_ms("CONNECT_TIMEOUT", 2_000),
             read_timeout: env_duration_ms("READ_TIMEOUT", 5_000),
-            retry_enabled: env_opt("RETRY_ENABLED")
-                .map_or(true, |v| v.to_lowercase() != "false"),
+            retry_enabled: env_opt("RETRY_ENABLED").map_or(true, |v| v.to_lowercase() != "false"),
             retry_max_attempts: env_u32("RETRY_MAX_ATTEMPTS", 5),
             retry_initial_delay: env_duration_ms("RETRY_INITIAL_DELAY", 500),
             retry_multiplier: env_f64("RETRY_MULTIPLIER", 2.0),

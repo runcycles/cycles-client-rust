@@ -28,13 +28,22 @@ impl<T> ApiResponse<T> {
     /// Create a new `ApiResponse` from response data and HTTP headers.
     pub(crate) fn from_response(data: T, headers: &reqwest::header::HeaderMap) -> Self {
         let header_str = |name: &str| -> Option<String> {
-            headers.get(name).and_then(|v| v.to_str().ok()).map(String::from)
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
         };
         let header_u32 = |name: &str| -> Option<u32> {
-            headers.get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok())
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok())
         };
         let header_u64 = |name: &str| -> Option<u64> {
-            headers.get(name).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok())
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok())
         };
 
         Self {

@@ -79,12 +79,7 @@ impl ReservationGuard {
         ttl_ms: u64,
     ) -> Self {
         let cancel = CancellationToken::new();
-        let heartbeat = start_heartbeat(
-            client.clone(),
-            id.clone(),
-            ttl_ms,
-            cancel.clone(),
-        );
+        let heartbeat = start_heartbeat(client.clone(), id.clone(), ttl_ms, cancel.clone());
 
         Self {
             client,
@@ -195,12 +190,8 @@ impl std::fmt::Debug for ReservationGuard {
     }
 }
 
-// ReservationGuard is Send (can move across .await points) but intentionally
-// not Sync (single-owner semantics — don't share across threads).
-#[cfg(test)]
-const _: () = {
+// Compile-time assertion: ReservationGuard is Send (can move across .await points).
+const _: fn() = || {
     fn assert_send<T: Send>() {}
-    fn check() {
-        assert_send::<ReservationGuard>();
-    }
+    assert_send::<ReservationGuard>();
 };

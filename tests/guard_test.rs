@@ -7,7 +7,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn setup_with_reservation(server: &MockServer) -> CyclesClient {
-    let client = CyclesClient::builder("key", &server.uri()).build();
+    let client = CyclesClient::builder("key", server.uri()).build();
 
     Mock::given(method("POST"))
         .and(path("/v1/reservations"))

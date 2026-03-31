@@ -8,7 +8,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn setup() -> (MockServer, CyclesClient) {
     let server = MockServer::start().await;
-    let client = CyclesClient::builder("test-api-key", &server.uri()).build();
+    let client = CyclesClient::builder("test-api-key", server.uri()).build();
     (server, client)
 }
 
@@ -72,7 +72,10 @@ async fn create_reservation_allow_with_caps() {
         .await;
 
     let req = ReservationCreateRequest::builder()
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("llm.completion", "gpt-4o"))
         .estimate(Amount::usd_microcents(5000))
         .build();
@@ -107,7 +110,10 @@ async fn create_reservation_with_metadata_has_headers() {
         .await;
 
     let req = ReservationCreateRequest::builder()
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("llm.completion", "gpt-4o"))
         .estimate(Amount::usd_microcents(5000))
         .build();
@@ -138,7 +144,10 @@ async fn create_reservation_budget_exceeded() {
         .await;
 
     let req = ReservationCreateRequest::builder()
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("llm.completion", "gpt-4o"))
         .estimate(Amount::usd_microcents(999999))
         .build();
@@ -163,7 +172,10 @@ async fn create_reservation_server_error() {
         .await;
 
     let req = ReservationCreateRequest::builder()
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("llm.completion", "gpt-4o"))
         .estimate(Amount::usd_microcents(5000))
         .build();
@@ -292,7 +304,10 @@ async fn decide_allow() {
         .await;
 
     let req = DecisionRequest::builder()
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("llm.completion", "gpt-4o"))
         .estimate(Amount::usd_microcents(5000))
         .build();
@@ -317,7 +332,10 @@ async fn decide_deny() {
         .await;
 
     let req = DecisionRequest::builder()
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("llm.completion", "gpt-4o"))
         .estimate(Amount::usd_microcents(5000))
         .build();
@@ -345,7 +363,10 @@ async fn create_event_success() {
         .await;
 
     let req = EventCreateRequest::builder()
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("tool.search", "web_search"))
         .actual(Amount::usd_microcents(1500))
         .build();
@@ -501,7 +522,10 @@ async fn reserve_returns_guard_on_allow() {
     let guard = client
         .reserve(
             ReservationCreateRequest::builder()
-                .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+                .subject(Subject {
+                    tenant: Some("acme".into()),
+                    ..Default::default()
+                })
                 .action(Action::new("llm.completion", "gpt-4o"))
                 .estimate(Amount::usd_microcents(5000))
                 .build(),
@@ -539,7 +563,10 @@ async fn reserve_returns_error_on_deny() {
     let err = client
         .reserve(
             ReservationCreateRequest::builder()
-                .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+                .subject(Subject {
+                    tenant: Some("acme".into()),
+                    ..Default::default()
+                })
                 .action(Action::new("llm.completion", "gpt-4o"))
                 .estimate(Amount::usd_microcents(999999))
                 .build(),
@@ -578,7 +605,10 @@ async fn reserve_validates_ttl() {
     let err = client
         .reserve(
             ReservationCreateRequest::builder()
-                .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+                .subject(Subject {
+                    tenant: Some("acme".into()),
+                    ..Default::default()
+                })
                 .action(Action::new("llm.completion", "gpt-4o"))
                 .estimate(Amount::usd_microcents(5000))
                 .ttl_ms(500_u64) // too low
@@ -600,7 +630,10 @@ async fn reserve_validates_negative_estimate() {
     let err = client
         .reserve(
             ReservationCreateRequest::builder()
-                .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+                .subject(Subject {
+                    tenant: Some("acme".into()),
+                    ..Default::default()
+                })
                 .action(Action::new("llm.completion", "gpt-4o"))
                 .estimate(Amount::usd_microcents(-1))
                 .build(),
@@ -652,7 +685,10 @@ async fn guard_commit_success() {
     let guard = client
         .reserve(
             ReservationCreateRequest::builder()
-                .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+                .subject(Subject {
+                    tenant: Some("acme".into()),
+                    ..Default::default()
+                })
                 .action(Action::new("llm.completion", "gpt-4o"))
                 .estimate(Amount::usd_microcents(5000))
                 .build(),
@@ -661,7 +697,11 @@ async fn guard_commit_success() {
         .unwrap();
 
     let resp = guard
-        .commit(CommitRequest::builder().actual(Amount::usd_microcents(3200)).build())
+        .commit(
+            CommitRequest::builder()
+                .actual(Amount::usd_microcents(3200))
+                .build(),
+        )
         .await
         .unwrap();
 
@@ -704,7 +744,10 @@ async fn guard_release_success() {
     let guard = client
         .reserve(
             ReservationCreateRequest::builder()
-                .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+                .subject(Subject {
+                    tenant: Some("acme".into()),
+                    ..Default::default()
+                })
                 .action(Action::new("llm.completion", "gpt-4o"))
                 .estimate(Amount::usd_microcents(5000))
                 .build(),
@@ -725,7 +768,10 @@ async fn transport_error_on_bad_url() {
         .build();
 
     let req = ReservationCreateRequest::builder()
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("llm.completion", "gpt-4o"))
         .estimate(Amount::usd_microcents(5000))
         .build();
@@ -755,7 +801,10 @@ async fn idempotency_key_sent_as_header() {
 
     let req = ReservationCreateRequest::builder()
         .idempotency_key(IdempotencyKey::new("my-idem-key"))
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("llm.completion", "gpt-4o"))
         .estimate(Amount::usd_microcents(5000))
         .build();
@@ -780,7 +829,10 @@ async fn unknown_error_code_does_not_crash() {
         .await;
 
     let req = ReservationCreateRequest::builder()
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("llm.completion", "gpt-4o"))
         .estimate(Amount::usd_microcents(5000))
         .build();

@@ -187,14 +187,15 @@ None. All endpoints, schemas, enums, headers, and validation constraints match t
 | `validation.rs`      | 100%     |
 | `guard.rs`           | 100%     |
 | `config.rs`          | 100%     |
-| `client.rs`          | 94%      |
-| `retry.rs`           | 83%      |
-| `error.rs`           | 94%      |
-| `response.rs`        | 93%      |
+| `lifecycle.rs`       | 100%     |
+| `client.rs`          | 95%      |
+| `response.rs`        | 96%      |
+| `retry.rs`           | 80%      |
+| `error.rs`           | 91%      |
 | `heartbeat.rs`       | 64%      |
-| **Overall**          | **95%+** |
+| **Overall**          | **95.3%**|
 
-124 total tests: 37 unit + 26 wiremock integration + 18 wire format compliance + 10 error + 10 config + 4 guard lifecycle + 2 response + 1 retry + 12 live server (ignored by default) + 4 doc-tests.
+141 total tests: 37 unit + 26 wiremock integration + 18 wire format compliance + 10 error + 10 config + 5 lifecycle + 4 guard lifecycle + 2 response + 1 retry + 12 live server (ignored by default) + 8 doc-tests.
 
 ---
 

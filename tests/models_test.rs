@@ -46,7 +46,10 @@ fn reservation_create_request_wire_format() {
 fn reservation_create_request_defaults_omit_optional() {
     let req = ReservationCreateRequest::builder()
         .idempotency_key(IdempotencyKey::new("k"))
-        .subject(Subject { tenant: Some("t".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("t".into()),
+            ..Default::default()
+        })
         .action(Action::new("a", "b"))
         .estimate(Amount::tokens(100))
         .build();
@@ -115,7 +118,10 @@ fn extend_request_wire_format() {
 fn decision_request_wire_format() {
     let req = DecisionRequest::builder()
         .idempotency_key(IdempotencyKey::new("dk-1"))
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("llm.completion", "gpt-4o"))
         .estimate(Amount::usd_microcents(5000))
         .build();
@@ -131,7 +137,10 @@ fn decision_request_wire_format() {
 fn event_create_request_wire_format() {
     let req = EventCreateRequest::builder()
         .idempotency_key(IdempotencyKey::new("ek-1"))
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("tool.search", "web_search"))
         .actual(Amount::usd_microcents(1500))
         .overage_policy(CommitOveragePolicy::AllowWithOverdraft)

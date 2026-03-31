@@ -258,9 +258,15 @@ mod tests {
             (ErrorCode::ReservationFinalized, "\"RESERVATION_FINALIZED\""),
             (ErrorCode::IdempotencyMismatch, "\"IDEMPOTENCY_MISMATCH\""),
             (ErrorCode::UnitMismatch, "\"UNIT_MISMATCH\""),
-            (ErrorCode::OverdraftLimitExceeded, "\"OVERDRAFT_LIMIT_EXCEEDED\""),
+            (
+                ErrorCode::OverdraftLimitExceeded,
+                "\"OVERDRAFT_LIMIT_EXCEEDED\"",
+            ),
             (ErrorCode::DebtOutstanding, "\"DEBT_OUTSTANDING\""),
-            (ErrorCode::MaxExtensionsExceeded, "\"MAX_EXTENSIONS_EXCEEDED\""),
+            (
+                ErrorCode::MaxExtensionsExceeded,
+                "\"MAX_EXTENSIONS_EXCEEDED\"",
+            ),
             (ErrorCode::InternalError, "\"INTERNAL_ERROR\""),
         ];
         for (variant, expected) in codes {
@@ -290,8 +296,14 @@ mod tests {
     fn serde_roundtrip_commit_overage_policy() {
         let policies = [
             (CommitOveragePolicy::Reject, "\"REJECT\""),
-            (CommitOveragePolicy::AllowIfAvailable, "\"ALLOW_IF_AVAILABLE\""),
-            (CommitOveragePolicy::AllowWithOverdraft, "\"ALLOW_WITH_OVERDRAFT\""),
+            (
+                CommitOveragePolicy::AllowIfAvailable,
+                "\"ALLOW_IF_AVAILABLE\"",
+            ),
+            (
+                CommitOveragePolicy::AllowWithOverdraft,
+                "\"ALLOW_WITH_OVERDRAFT\"",
+            ),
         ];
         for (variant, expected) in policies {
             let json = serde_json::to_string(&variant).unwrap();

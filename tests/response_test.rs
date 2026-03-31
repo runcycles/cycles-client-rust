@@ -9,7 +9,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[tokio::test]
 async fn api_response_into_inner() {
     let server = MockServer::start().await;
-    let client = CyclesClient::builder("key", &server.uri()).build();
+    let client = CyclesClient::builder("key", server.uri()).build();
 
     Mock::given(method("POST"))
         .and(path("/v1/reservations"))
@@ -27,7 +27,10 @@ async fn api_response_into_inner() {
         .await;
 
     let req = ReservationCreateRequest::builder()
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("llm.completion", "gpt-4o"))
         .estimate(Amount::usd_microcents(5000))
         .build();
@@ -50,7 +53,7 @@ async fn api_response_into_inner() {
 #[tokio::test]
 async fn api_response_missing_optional_headers() {
     let server = MockServer::start().await;
-    let client = CyclesClient::builder("key", &server.uri()).build();
+    let client = CyclesClient::builder("key", server.uri()).build();
 
     Mock::given(method("POST"))
         .and(path("/v1/reservations"))
@@ -63,7 +66,10 @@ async fn api_response_missing_optional_headers() {
         .await;
 
     let req = ReservationCreateRequest::builder()
-        .subject(Subject { tenant: Some("acme".into()), ..Default::default() })
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
         .action(Action::new("llm.completion", "gpt-4o"))
         .estimate(Amount::usd_microcents(5000))
         .build();

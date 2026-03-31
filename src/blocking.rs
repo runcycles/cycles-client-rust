@@ -80,10 +80,7 @@ pub mod sync_client {
         }
 
         /// Create a direct-debit event (blocking).
-        pub fn create_event(
-            &self,
-            req: &EventCreateRequest,
-        ) -> Result<EventCreateResponse, Error> {
+        pub fn create_event(&self, req: &EventCreateRequest) -> Result<EventCreateResponse, Error> {
             self.rt.block_on(self.inner.create_event(req))
         }
 
@@ -96,18 +93,12 @@ pub mod sync_client {
         }
 
         /// Get a single reservation (blocking).
-        pub fn get_reservation(
-            &self,
-            id: &ReservationId,
-        ) -> Result<ReservationDetail, Error> {
+        pub fn get_reservation(&self, id: &ReservationId) -> Result<ReservationDetail, Error> {
             self.rt.block_on(self.inner.get_reservation(id))
         }
 
         /// Query balances (blocking).
-        pub fn get_balances(
-            &self,
-            params: &BalanceParams,
-        ) -> Result<BalanceResponse, Error> {
+        pub fn get_balances(&self, params: &BalanceParams) -> Result<BalanceResponse, Error> {
             self.rt.block_on(self.inner.get_balances(params))
         }
     }

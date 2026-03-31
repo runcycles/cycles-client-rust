@@ -139,7 +139,9 @@ async fn live_low_level_create_commit() {
         .expect("create_reservation should succeed");
 
     assert!(create_resp.decision.is_allowed());
-    let rsv_id = create_resp.reservation_id.expect("should have reservation_id");
+    let rsv_id = create_resp
+        .reservation_id
+        .expect("should have reservation_id");
     assert!(!create_resp.affected_scopes.is_empty());
     println!("Created: {}", rsv_id);
 
@@ -147,9 +149,7 @@ async fn live_low_level_create_commit() {
     let commit_resp = client
         .commit_reservation(
             &rsv_id,
-            &CommitRequest::builder()
-                .actual(Amount::tokens(80))
-                .build(),
+            &CommitRequest::builder().actual(Amount::tokens(80)).build(),
         )
         .await
         .expect("commit should succeed");
@@ -283,19 +283,12 @@ async fn live_reserve_extend_commit() {
     println!("Reserved: {} (short TTL)", rsv_id);
 
     // Manually extend
-    guard
-        .extend(30_000)
-        .await
-        .expect("extend should succeed");
+    guard.extend(30_000).await.expect("extend should succeed");
     println!("Extended TTL by 30s");
 
     // Commit
     let resp = guard
-        .commit(
-            CommitRequest::builder()
-                .actual(Amount::tokens(800))
-                .build(),
-        )
+        .commit(CommitRequest::builder().actual(Amount::tokens(800)).build())
         .await
         .expect("commit should succeed");
 

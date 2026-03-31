@@ -62,9 +62,7 @@ impl Error {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport(_) => true,
-            Self::Api {
-                status, code, ..
-            } => {
+            Self::Api { status, code, .. } => {
                 if *status >= 500 {
                     return true;
                 }
@@ -78,7 +76,13 @@ impl Error {
     /// Returns `true` if this is a budget exceeded error.
     pub fn is_budget_exceeded(&self) -> bool {
         matches!(self, Self::BudgetExceeded { .. })
-            || matches!(self, Self::Api { code: Some(ErrorCode::BudgetExceeded), .. })
+            || matches!(
+                self,
+                Self::Api {
+                    code: Some(ErrorCode::BudgetExceeded),
+                    ..
+                }
+            )
     }
 
     /// Returns the suggested retry delay, if any.
