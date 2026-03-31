@@ -106,11 +106,11 @@ type system and ownership model:
 | **Forward-compatible** | `#[non_exhaustive]` enums for protocol evolution |
 | **Zero mapper code** | `serde` with `rename_all` handles wire format natively |
 
-### RAII Guard (Primary API)
+### RAII Guard
 
-The `ReservationGuard` is the core abstraction. It holds a live reservation and
-auto-extends TTL via a background heartbeat. The guard IS the context — no
-thread-locals or task-locals needed.
+The `ReservationGuard` gives manual control over the lifecycle. It holds a live
+reservation and auto-extends TTL via a background heartbeat. The guard IS the
+context — no thread-locals or task-locals needed.
 
 ```rust,no_run
 # use runcycles::{CyclesClient, Error, models::*};

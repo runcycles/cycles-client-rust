@@ -2,7 +2,7 @@
 
 - **Date:** 2026-03-31
 - **Spec:** `cycles-protocol-v0.yaml` v0.1.24 (OpenAPI 3.1.0)
-- **Client:** Rust 1.75+, reqwest 0.12, serde 1, tokio 1, bon 3
+- **Client:** Rust 1.88+ (MSRV), reqwest 0.12, serde 1, tokio 1, bon 3
 - **Cross-reference:** [cycles-server AUDIT.md](https://github.com/runcycles/cycles-server/blob/main/AUDIT.md)
 
 ---
