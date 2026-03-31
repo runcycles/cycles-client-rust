@@ -85,7 +85,7 @@ impl CyclesConfig {
             toolset: env_opt("TOOLSET"),
             connect_timeout: env_duration_ms("CONNECT_TIMEOUT", 2_000),
             read_timeout: env_duration_ms("READ_TIMEOUT", 5_000),
-            retry_enabled: env_opt("RETRY_ENABLED").map_or(true, |v| v.to_lowercase() != "false"),
+            retry_enabled: env_opt("RETRY_ENABLED").is_none_or(|v| v.to_lowercase() != "false"),
             retry_max_attempts: env_u32("RETRY_MAX_ATTEMPTS", 5),
             retry_initial_delay: env_duration_ms("RETRY_INITIAL_DELAY", 500),
             retry_multiplier: env_f64("RETRY_MULTIPLIER", 2.0),
