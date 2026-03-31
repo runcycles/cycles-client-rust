@@ -95,5 +95,9 @@ pub use client::CyclesClient;
 pub use config::CyclesConfig;
 pub use error::Error;
 pub use guard::ReservationGuard;
-pub use lifecycle::{with_cycles, WithCyclesConfig};
+pub use lifecycle::{with_cycles, GuardContext, WithCyclesConfig};
 pub use response::ApiResponse;
+
+// Re-export BlockingCyclesClient when the blocking feature is enabled.
+#[cfg(feature = "blocking")]
+pub use blocking::sync_client::BlockingCyclesClient;
