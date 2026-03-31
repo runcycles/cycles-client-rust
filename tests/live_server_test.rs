@@ -4,8 +4,8 @@
 //! - A tenant "demo-corp" with TOKENS budget
 //! - An API key "cyc_live_newky234567890abcdef" mapped to demo-corp
 //!
-//! Run with: cargo test --test live_server_test
-//! Skip with: cargo test --test live_server_test -- --ignored  (tests are #[ignore] by default)
+//! Run with: cargo test --test live_server_test -- --ignored
+//! These tests are `#[ignore]` by default — they only run when explicitly requested.
 
 use runcycles::models::*;
 use runcycles::{CyclesClient, Error};
@@ -30,6 +30,7 @@ fn subject() -> Subject {
 // ─── Full reserve → commit lifecycle ─────────────────────────────
 
 #[tokio::test]
+#[ignore]
 async fn live_full_lifecycle_reserve_commit() {
     let client = client();
 
@@ -80,6 +81,7 @@ async fn live_full_lifecycle_reserve_commit() {
 // ─── Full reserve → release lifecycle ────────────────────────────
 
 #[tokio::test]
+#[ignore]
 async fn live_full_lifecycle_reserve_release() {
     let client = client();
 
@@ -120,6 +122,7 @@ async fn live_full_lifecycle_reserve_release() {
 // ─── Low-level API: create → commit ─────────────────────────────
 
 #[tokio::test]
+#[ignore]
 async fn live_low_level_create_commit() {
     let client = client();
 
@@ -159,6 +162,7 @@ async fn live_low_level_create_commit() {
 // ─── Decide (preflight) ─────────────────────────────────────────
 
 #[tokio::test]
+#[ignore]
 async fn live_decide_preflight() {
     let client = client();
 
@@ -180,6 +184,7 @@ async fn live_decide_preflight() {
 // ─── Events (direct debit) ──────────────────────────────────────
 
 #[tokio::test]
+#[ignore]
 async fn live_create_event() {
     let client = client();
 
@@ -202,6 +207,7 @@ async fn live_create_event() {
 // ─── Balances ────────────────────────────────────────────────────
 
 #[tokio::test]
+#[ignore]
 async fn live_get_balances() {
     let client = client();
 
@@ -240,6 +246,7 @@ async fn live_get_balances() {
 // ─── List reservations ──────────────────────────────────────────
 
 #[tokio::test]
+#[ignore]
 async fn live_list_reservations() {
     let client = client();
 
@@ -256,6 +263,7 @@ async fn live_list_reservations() {
 // ─── Extend (heartbeat) ─────────────────────────────────────────
 
 #[tokio::test]
+#[ignore]
 async fn live_reserve_extend_commit() {
     let client = client();
 
@@ -298,6 +306,7 @@ async fn live_reserve_extend_commit() {
 // ─── Metadata with response headers ─────────────────────────────
 
 #[tokio::test]
+#[ignore]
 async fn live_response_metadata() {
     let client = client();
 
@@ -328,6 +337,7 @@ async fn live_response_metadata() {
 // ─── Error handling: auth failure ────────────────────────────────
 
 #[tokio::test]
+#[ignore]
 async fn live_auth_failure() {
     let bad_client = CyclesClient::builder("bad-key", BASE_URL).build();
 
@@ -355,6 +365,7 @@ async fn live_auth_failure() {
 // ─── Guard auto-release on drop ──────────────────────────────────
 
 #[tokio::test]
+#[ignore]
 async fn live_guard_drop_auto_releases() {
     let client = client();
 
@@ -396,6 +407,7 @@ async fn live_guard_drop_auto_releases() {
 // ─── Dry run ─────────────────────────────────────────────────────
 
 #[tokio::test]
+#[ignore]
 async fn live_dry_run() {
     let client = client();
 

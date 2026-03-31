@@ -8,6 +8,7 @@ use crate::models::{CommitRequest, ReservationId};
 
 /// Retries failed commit operations in the background with exponential backoff.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Wired into guard commit-failure path in a future release
 pub(crate) struct CommitRetryEngine {
     enabled: bool,
     max_attempts: u32,
@@ -16,6 +17,7 @@ pub(crate) struct CommitRetryEngine {
     max_delay: Duration,
 }
 
+#[allow(dead_code)]
 impl CommitRetryEngine {
     /// Create a new retry engine from client configuration.
     pub fn new(config: &CyclesConfig) -> Self {

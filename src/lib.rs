@@ -59,13 +59,13 @@
 pub mod blocking;
 pub mod client;
 pub mod config;
-pub mod constants;
+pub(crate) mod constants;
 pub mod error;
 pub mod guard;
-pub mod heartbeat;
+pub(crate) mod heartbeat;
 pub mod models;
 pub mod response;
-pub mod retry;
+pub(crate) mod retry;
 pub mod validation;
 
 // Re-export primary types at crate root for ergonomic imports.

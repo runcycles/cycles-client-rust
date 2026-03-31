@@ -20,7 +20,6 @@ pub struct ReservationCreateRequest {
     pub estimate: Amount,
     /// Time-to-live in milliseconds (default: 60000).
     #[builder(default = 60_000)]
-    #[serde(skip_serializing_if = "is_default_ttl")]
     pub ttl_ms: u64,
     /// Grace period in milliseconds after TTL before expiry.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -199,8 +198,4 @@ impl BalanceParams {
 
 fn is_false(v: &bool) -> bool {
     !v
-}
-
-fn is_default_ttl(v: &u64) -> bool {
-    *v == 60_000
 }

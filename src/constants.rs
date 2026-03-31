@@ -6,9 +6,6 @@ pub const API_KEY_HEADER: &str = "X-Cycles-API-Key";
 /// HTTP header name for idempotency keys.
 pub const IDEMPOTENCY_KEY_HEADER: &str = "X-Idempotency-Key";
 
-/// Default reservation TTL in milliseconds.
-pub const DEFAULT_TTL_MS: u64 = 60_000;
-
 /// Minimum allowed TTL in milliseconds.
 pub const MIN_TTL_MS: u64 = 1_000;
 

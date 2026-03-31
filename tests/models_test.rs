@@ -56,8 +56,8 @@ fn reservation_create_request_defaults_omit_optional() {
     assert!(json.get("overage_policy").is_none());
     assert!(json.get("dry_run").is_none()); // false is skipped
     assert!(json.get("metadata").is_none());
-    // Default TTL is also skipped
-    assert!(json.get("ttl_ms").is_none());
+    // Default TTL is always sent explicitly
+    assert_eq!(json["ttl_ms"], 60_000);
 }
 
 #[test]
