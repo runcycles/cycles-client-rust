@@ -43,6 +43,27 @@
 //! # }
 //! ```
 //!
+//! ## Automatic Lifecycle (like Python's `@cycles` or TypeScript's `withCycles`)
+//!
+//! ```rust,no_run
+//! use runcycles::{CyclesClient, with_cycles, WithCyclesConfig, models::*};
+//!
+//! # async fn example() -> Result<(), runcycles::Error> {
+//! # let client = CyclesClient::builder("key", "http://localhost:7878").tenant("acme").build();
+//! let reply = with_cycles(
+//!     &client,
+//!     WithCyclesConfig::new(Amount::tokens(1000))
+//!         .action("llm.completion", "gpt-4o")
+//!         .subject(Subject { tenant: Some("acme".into()), ..Default::default() }),
+//!     |ctx| async move {
+//!         let result = "Hello from LLM".to_string();
+//!         Ok((result, Amount::tokens(42)))
+//!     },
+//! ).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! ## Design Principles
 //!
 //! - **Ownership safety**: `commit(self)` and `release(self)` consume the guard,
@@ -63,6 +84,7 @@ pub(crate) mod constants;
 pub mod error;
 pub mod guard;
 pub(crate) mod heartbeat;
+pub mod lifecycle;
 pub mod models;
 pub mod response;
 pub(crate) mod retry;
@@ -73,4 +95,5 @@ pub use client::CyclesClient;
 pub use config::CyclesConfig;
 pub use error::Error;
 pub use guard::ReservationGuard;
+pub use lifecycle::{with_cycles, WithCyclesConfig};
 pub use response::ApiResponse;

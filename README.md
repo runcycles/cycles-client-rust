@@ -13,14 +13,48 @@ idiomatic Rust API built around RAII guards and ownership semantics.
 runcycles = "0.1"
 ```
 
-## Quick Start
+## Quick Start — Automatic Lifecycle (`with_cycles`)
+
+Like Python's `@cycles` decorator or TypeScript's `withCycles`. Reserve, execute,
+and commit/release are handled automatically:
+
+```rust,no_run
+use runcycles::{CyclesClient, with_cycles, WithCyclesConfig, models::*};
+
+#[tokio::main]
+async fn main() -> Result<(), runcycles::Error> {
+    let client = CyclesClient::builder("my-api-key", "http://localhost:7878")
+        .tenant("acme")
+        .build();
+
+    let reply = with_cycles(
+        &client,
+        WithCyclesConfig::new(Amount::tokens(1000))
+            .action("llm.completion", "gpt-4o")
+            .subject(Subject { tenant: Some("acme".into()), ..Default::default() }),
+        |ctx| async move {
+            // ctx.caps, ctx.decision, ctx.reservation_id available
+            let result = call_llm("Hello").await;
+            Ok((result, Amount::tokens(42)))   // (return_value, actual_cost)
+        },
+    ).await?;
+    // On success → auto-commits. On error → auto-releases.
+
+    println!("LLM said: {reply}");
+    Ok(())
+}
+# async fn call_llm(_: &str) -> String { "hi".into() }
+```
+
+## Manual Control — RAII Guard
+
+For streaming, multi-step workflows, or when you need full control:
 
 ```rust,no_run
 use runcycles::{CyclesClient, Error, models::*};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    // Create a client
     let client = CyclesClient::builder("my-api-key", "http://localhost:7878")
         .tenant("acme")
         .build();
