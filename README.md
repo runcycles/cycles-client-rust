@@ -16,7 +16,7 @@ idiomatic Rust API built around RAII guards and ownership semantics.
 
 ```toml
 [dependencies]
-runcycles = "0.1"
+runcycles = "0.2"
 ```
 
 ## Quick Start — Automatic Lifecycle (`with_cycles`)
