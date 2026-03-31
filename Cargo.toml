@@ -11,6 +11,7 @@ homepage = "https://runcycles.io"
 documentation = "https://docs.rs/runcycles"
 keywords = ["cycles", "budget", "llm", "ai-agents", "cost-control"]
 categories = ["api-bindings", "asynchronous", "web-programming::http-client"]
+exclude = [".github/", "CLAUDE.md", "AUDIT.md", "tests/live_server_test.rs"]
 
 [package.metadata.docs.rs]
 all-features = true
