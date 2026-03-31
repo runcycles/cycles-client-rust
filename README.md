@@ -1,6 +1,12 @@
-# runcycles
+[![Crates.io](https://img.shields.io/crates/v/runcycles)](https://crates.io/crates/runcycles)
+[![docs.rs](https://img.shields.io/docsrs/runcycles)](https://docs.rs/runcycles)
+[![CI](https://github.com/runcycles/cycles-client-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/runcycles/cycles-client-rust/actions)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](https://github.com/runcycles/cycles-client-rust/actions)
 
-Rust client for the [Cycles](https://runcycles.io) budget authority protocol.
+# Cycles Rust Client
+
+Rust client for the [Cycles](https://runcycles.io) budget-management protocol — deterministic spend control for AI agents and LLM workflows.
 
 Cycles provides concurrency-safe spend and action control for autonomous agent
 runtimes. This crate implements the reserve-execute-commit lifecycle with an
