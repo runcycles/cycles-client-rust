@@ -147,8 +147,8 @@ impl WithCyclesConfig {
 /// This is the Rust equivalent of Python's `@cycles` decorator and
 /// TypeScript's `withCycles` higher-order function.
 ///
-/// The closure receives a reference to the [`ReservationGuard`] (for accessing
-/// caps, reservation ID, etc.) and must return `Ok((result, actual_cost))` on
+/// The closure receives a [`GuardContext`] (owned snapshot of the reservation's
+/// decision, caps, and ID) and must return `Ok((result, actual_cost))` on
 /// success or `Err` on failure.
 ///
 /// - On **success**: commits with the returned `actual_cost`, returns `result`.
