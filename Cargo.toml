@@ -2,7 +2,7 @@
 name = "runcycles"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "Rust client for the Cycles budget-management protocol — deterministic spend control for AI agents and LLM workflows"
 readme = "README.md"
