@@ -1,13 +1,23 @@
 [package]
 name = "runcycles"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
-description = "Rust client for the Cycles budget authority protocol"
+description = "Rust client for the Cycles budget-management protocol — deterministic spend control for AI agents and LLM workflows"
+readme = "README.md"
 repository = "https://github.com/runcycles/cycles-client-rust"
-keywords = ["cycles", "budget", "api-client", "agent", "llm"]
-categories = ["api-bindings", "asynchronous"]
+homepage = "https://runcycles.io"
+documentation = "https://docs.rs/runcycles"
+keywords = ["cycles", "budget", "llm", "ai-agents", "cost-control"]
+categories = ["api-bindings", "asynchronous", "web-programming::http-client"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[badges]
+maintenance = { status = "actively-developed" }
 
 [features]
 default = ["rustls-tls"]
