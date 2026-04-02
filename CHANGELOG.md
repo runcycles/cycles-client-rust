@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.2] - 2026-04-02
+
+### Fixed
+
+- Removed `BlockingCyclesClient::builder()` which misleadingly returned a builder that produces an async client
+- Added `CyclesClientBuilder::build_blocking()` to correctly build a `BlockingCyclesClient` from the shared builder
+
+### Added
+
+- `Amount::risk_points()` convenience constructor matching existing `usd_microcents()`, `tokens()`, and `credits()` constructors
+- `SignedAmount` convenience constructors: `usd_microcents()`, `tokens()`, `credits()`, `risk_points()`
+- `BlockingCyclesClient::config()` accessor for parity with async client
+- `BlockingCyclesClient::create_reservation_with_metadata()` for accessing response headers in blocking mode
+
 ## [0.2.1] - 2026-03-31
 
 ### Fixed

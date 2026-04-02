@@ -6,11 +6,12 @@
 
 #[cfg(feature = "blocking")]
 pub mod sync_client {
-    use crate::config::{CyclesClientBuilder, CyclesConfig};
+    use crate::config::CyclesConfig;
     use crate::error::Error;
     use crate::models::request::*;
     use crate::models::response::*;
     use crate::models::ReservationId;
+    use crate::response::ApiResponse;
 
     /// Synchronous (blocking) client for the Cycles API.
     ///
@@ -21,14 +22,6 @@ pub mod sync_client {
     }
 
     impl BlockingCyclesClient {
-        /// Create a new blocking client builder.
-        pub fn builder(
-            api_key: impl Into<String>,
-            base_url: impl Into<String>,
-        ) -> CyclesClientBuilder {
-            CyclesClientBuilder::new(api_key, base_url)
-        }
-
         /// Create a blocking client from a config.
         pub fn new(config: CyclesConfig) -> Result<Self, Error> {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -39,12 +32,26 @@ pub mod sync_client {
             Ok(Self { inner, rt })
         }
 
+        /// Access the client configuration.
+        pub fn config(&self) -> &CyclesConfig {
+            self.inner.config()
+        }
+
         /// Create a reservation (blocking).
         pub fn create_reservation(
             &self,
             req: &ReservationCreateRequest,
         ) -> Result<ReservationCreateResponse, Error> {
             self.rt.block_on(self.inner.create_reservation(req))
+        }
+
+        /// Create a reservation with response metadata (blocking).
+        pub fn create_reservation_with_metadata(
+            &self,
+            req: &ReservationCreateRequest,
+        ) -> Result<ApiResponse<ReservationCreateResponse>, Error> {
+            self.rt
+                .block_on(self.inner.create_reservation_with_metadata(req))
         }
 
         /// Commit a reservation (blocking).

@@ -39,6 +39,14 @@ impl Amount {
             amount,
         }
     }
+
+    /// Create an amount in risk points.
+    pub fn risk_points(amount: i64) -> Self {
+        Self {
+            unit: Unit::RiskPoints,
+            amount,
+        }
+    }
 }
 
 /// A signed budget amount (can be negative for debt).
@@ -48,6 +56,40 @@ pub struct SignedAmount {
     pub unit: Unit,
     /// The amount (may be negative).
     pub amount: i64,
+}
+
+impl SignedAmount {
+    /// Create a signed amount in USD microcents.
+    pub fn usd_microcents(amount: i64) -> Self {
+        Self {
+            unit: Unit::UsdMicrocents,
+            amount,
+        }
+    }
+
+    /// Create a signed amount in tokens.
+    pub fn tokens(amount: i64) -> Self {
+        Self {
+            unit: Unit::Tokens,
+            amount,
+        }
+    }
+
+    /// Create a signed amount in credits.
+    pub fn credits(amount: i64) -> Self {
+        Self {
+            unit: Unit::Credits,
+            amount,
+        }
+    }
+
+    /// Create a signed amount in risk points.
+    pub fn risk_points(amount: i64) -> Self {
+        Self {
+            unit: Unit::RiskPoints,
+            amount,
+        }
+    }
 }
 
 /// Subject identifies who is spending. At least one field must be set.
@@ -218,6 +260,29 @@ mod tests {
         let c = Amount::credits(50);
         assert_eq!(c.unit, Unit::Credits);
         assert_eq!(c.amount, 50);
+
+        let d = Amount::risk_points(75);
+        assert_eq!(d.unit, Unit::RiskPoints);
+        assert_eq!(d.amount, 75);
+    }
+
+    #[test]
+    fn signed_amount_constructors() {
+        let a = SignedAmount::usd_microcents(-500);
+        assert_eq!(a.unit, Unit::UsdMicrocents);
+        assert_eq!(a.amount, -500);
+
+        let b = SignedAmount::tokens(200);
+        assert_eq!(b.unit, Unit::Tokens);
+        assert_eq!(b.amount, 200);
+
+        let c = SignedAmount::credits(-10);
+        assert_eq!(c.unit, Unit::Credits);
+        assert_eq!(c.amount, -10);
+
+        let d = SignedAmount::risk_points(30);
+        assert_eq!(d.unit, Unit::RiskPoints);
+        assert_eq!(d.amount, 30);
     }
 
     #[test]

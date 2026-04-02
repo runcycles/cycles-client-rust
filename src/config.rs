@@ -206,4 +206,12 @@ impl CyclesClientBuilder {
     pub fn build(self) -> crate::CyclesClient {
         crate::CyclesClient::from_builder(self.config, self.http_client)
     }
+
+    /// Build a [`BlockingCyclesClient`](crate::BlockingCyclesClient).
+    ///
+    /// Only available when the `blocking` feature is enabled.
+    #[cfg(feature = "blocking")]
+    pub fn build_blocking(self) -> Result<crate::BlockingCyclesClient, crate::Error> {
+        crate::BlockingCyclesClient::new(self.config)
+    }
 }
