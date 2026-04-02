@@ -176,6 +176,10 @@ The `ReservationGuard` RAII type (`src/guard.rs`) implements the reserve → exe
 
 2. **Missing `Amount::risk_points()` constructor** — `RISK_POINTS` is a first-class unit in the protocol but lacked the convenience constructor that `usd_microcents()`, `tokens()`, and `credits()` all had. **Fix:** added `Amount::risk_points(amount: i64)`.
 
+3. **`SignedAmount` missing all convenience constructors** — `Amount` had four constructors but `SignedAmount` had none, forcing manual struct construction. **Fix:** added `usd_microcents()`, `tokens()`, `credits()`, `risk_points()` to `SignedAmount`.
+
+4. **`BlockingCyclesClient` missing `config()` and `_with_metadata` variant** — async client exposed `config()` and `create_reservation_with_metadata()` but blocking client did not. **Fix:** added both methods.
+
 ### Prior Audit (0.2.0–0.2.1)
 
 None. All endpoints, schemas, enums, headers, and validation constraints match the OpenAPI spec v0.1.24.

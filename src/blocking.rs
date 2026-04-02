@@ -11,6 +11,7 @@ pub mod sync_client {
     use crate::models::request::*;
     use crate::models::response::*;
     use crate::models::ReservationId;
+    use crate::response::ApiResponse;
 
     /// Synchronous (blocking) client for the Cycles API.
     ///
@@ -31,12 +32,26 @@ pub mod sync_client {
             Ok(Self { inner, rt })
         }
 
+        /// Access the client configuration.
+        pub fn config(&self) -> &CyclesConfig {
+            self.inner.config()
+        }
+
         /// Create a reservation (blocking).
         pub fn create_reservation(
             &self,
             req: &ReservationCreateRequest,
         ) -> Result<ReservationCreateResponse, Error> {
             self.rt.block_on(self.inner.create_reservation(req))
+        }
+
+        /// Create a reservation with response metadata (blocking).
+        pub fn create_reservation_with_metadata(
+            &self,
+            req: &ReservationCreateRequest,
+        ) -> Result<ApiResponse<ReservationCreateResponse>, Error> {
+            self.rt
+                .block_on(self.inner.create_reservation_with_metadata(req))
         }
 
         /// Commit a reservation (blocking).

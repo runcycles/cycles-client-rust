@@ -14,6 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ### Added
 
 - `Amount::risk_points()` convenience constructor matching existing `usd_microcents()`, `tokens()`, and `credits()` constructors
+- `SignedAmount` convenience constructors: `usd_microcents()`, `tokens()`, `credits()`, `risk_points()`
+- `BlockingCyclesClient::config()` accessor for parity with async client
+- `BlockingCyclesClient::create_reservation_with_metadata()` for accessing response headers in blocking mode
 
 ## [0.2.1] - 2026-03-31
 
