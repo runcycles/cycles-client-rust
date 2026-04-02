@@ -39,6 +39,14 @@ impl Amount {
             amount,
         }
     }
+
+    /// Create an amount in risk points.
+    pub fn risk_points(amount: i64) -> Self {
+        Self {
+            unit: Unit::RiskPoints,
+            amount,
+        }
+    }
 }
 
 /// A signed budget amount (can be negative for debt).
@@ -218,6 +226,10 @@ mod tests {
         let c = Amount::credits(50);
         assert_eq!(c.unit, Unit::Credits);
         assert_eq!(c.amount, 50);
+
+        let d = Amount::risk_points(75);
+        assert_eq!(d.unit, Unit::RiskPoints);
+        assert_eq!(d.amount, 75);
     }
 
     #[test]

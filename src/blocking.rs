@@ -6,7 +6,7 @@
 
 #[cfg(feature = "blocking")]
 pub mod sync_client {
-    use crate::config::{CyclesClientBuilder, CyclesConfig};
+    use crate::config::CyclesConfig;
     use crate::error::Error;
     use crate::models::request::*;
     use crate::models::response::*;
@@ -21,14 +21,6 @@ pub mod sync_client {
     }
 
     impl BlockingCyclesClient {
-        /// Create a new blocking client builder.
-        pub fn builder(
-            api_key: impl Into<String>,
-            base_url: impl Into<String>,
-        ) -> CyclesClientBuilder {
-            CyclesClientBuilder::new(api_key, base_url)
-        }
-
         /// Create a blocking client from a config.
         pub fn new(config: CyclesConfig) -> Result<Self, Error> {
             let rt = tokio::runtime::Builder::new_current_thread()

@@ -1,6 +1,6 @@
 # Protocol Conformance Audit — Rust Client
 
-- **Date:** 2026-03-31
+- **Date:** 2026-04-02
 - **Spec:** `cycles-protocol-v0.yaml` v0.1.24 (OpenAPI 3.1.0)
 - **Client:** Rust 1.88+ (MSRV), reqwest 0.12, serde 1, tokio 1, bon 3
 - **Cross-reference:** [cycles-server AUDIT.md](https://github.com/runcycles/cycles-server/blob/main/AUDIT.md)
@@ -170,7 +170,13 @@ The `ReservationGuard` RAII type (`src/guard.rs`) implements the reserve → exe
 
 ---
 
-## Issues Found
+## Issues Found & Resolved (0.2.2)
+
+1. **`BlockingCyclesClient::builder()` returned async builder** — `BlockingCyclesClient::builder()` returned `CyclesClientBuilder` whose `build()` produces `CyclesClient` (async), silently giving the wrong client type. **Fix:** removed `BlockingCyclesClient::builder()`; added `CyclesClientBuilder::build_blocking()` (feature-gated behind `blocking`) that returns `Result<BlockingCyclesClient, Error>`.
+
+2. **Missing `Amount::risk_points()` constructor** — `RISK_POINTS` is a first-class unit in the protocol but lacked the convenience constructor that `usd_microcents()`, `tokens()`, and `credits()` all had. **Fix:** added `Amount::risk_points(amount: i64)`.
+
+### Prior Audit (0.2.0–0.2.1)
 
 None. All endpoints, schemas, enums, headers, and validation constraints match the OpenAPI spec v0.1.24.
 
