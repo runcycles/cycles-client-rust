@@ -28,8 +28,8 @@ fn tenant() -> String {
 }
 
 fn client() -> CyclesClient {
-    CyclesClient::builder(&api_key(), &base_url())
-        .tenant(&tenant())
+    CyclesClient::builder(api_key(), base_url())
+        .tenant(tenant())
         .build()
 }
 
@@ -345,7 +345,7 @@ async fn live_response_metadata() {
 #[tokio::test]
 #[ignore]
 async fn live_auth_failure() {
-    let bad_client = CyclesClient::builder("bad-key", &base_url()).build();
+    let bad_client = CyclesClient::builder("bad-key", base_url()).build();
 
     let err = bad_client
         .create_reservation(
