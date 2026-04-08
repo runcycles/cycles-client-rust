@@ -1,8 +1,9 @@
 //! Live integration tests against a real Cycles server.
 //!
-//! These tests require a running Cycles server on localhost:7878 with:
-//! - A tenant "demo-corp" with TOKENS budget
-//! - An API key "cyc_live_newky234567890abcdef" mapped to demo-corp
+//! These tests read configuration from environment variables:
+//! - `CYCLES_API_KEY`  — defaults to "cyc_live_newky234567890abcdef"
+//! - `CYCLES_BASE_URL` — defaults to "http://localhost:7878"
+//! - `CYCLES_TENANT`   — defaults to "demo-corp"
 //!
 //! Run with: cargo test --test live_server_test -- --ignored
 //! These tests are `#[ignore]` by default — they only run when explicitly requested.
@@ -10,19 +11,31 @@
 use runcycles::models::*;
 use runcycles::{CyclesClient, Error};
 
-const API_KEY: &str = "cyc_live_newky234567890abcdef";
-const BASE_URL: &str = "http://localhost:7878";
-const TENANT: &str = "demo-corp";
+const DEFAULT_API_KEY: &str = "cyc_live_newky234567890abcdef";
+const DEFAULT_BASE_URL: &str = "http://localhost:7878";
+const DEFAULT_TENANT: &str = "demo-corp";
+
+fn api_key() -> String {
+    std::env::var("CYCLES_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string())
+}
+
+fn base_url() -> String {
+    std::env::var("CYCLES_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+}
+
+fn tenant() -> String {
+    std::env::var("CYCLES_TENANT").unwrap_or_else(|_| DEFAULT_TENANT.to_string())
+}
 
 fn client() -> CyclesClient {
-    CyclesClient::builder(API_KEY, BASE_URL)
-        .tenant(TENANT)
+    CyclesClient::builder(&api_key(), &base_url())
+        .tenant(&tenant())
         .build()
 }
 
 fn subject() -> Subject {
     Subject {
-        tenant: Some(TENANT.into()),
+        tenant: Some(tenant()),
         ..Default::default()
     }
 }
@@ -230,7 +243,7 @@ async fn live_get_balances() {
 
     let resp = client
         .get_balances(&BalanceParams {
-            tenant: Some(TENANT.into()),
+            tenant: Some(tenant()),
             ..Default::default()
         })
         .await
@@ -332,7 +345,7 @@ async fn live_response_metadata() {
 #[tokio::test]
 #[ignore]
 async fn live_auth_failure() {
-    let bad_client = CyclesClient::builder("bad-key", BASE_URL).build();
+    let bad_client = CyclesClient::builder("bad-key", &base_url()).build();
 
     let err = bad_client
         .create_reservation(
