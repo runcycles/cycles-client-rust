@@ -80,6 +80,14 @@ pub struct WithCyclesConfig {
 impl WithCyclesConfig {
     /// Create a new config with the estimated cost.
     ///
+    /// The `estimate`'s [`Unit`](crate::models::Unit) **must match** the unit
+    /// of the active budget at the target scope. The server indexes budgets
+    /// by the composite key `(scope, unit)`, so reserving in a different unit
+    /// than the stored budget surfaces as a `404 NOT_FOUND` with a message
+    /// like `"Budget not found for provided scope: tenant:rider"` — even
+    /// though the scope itself exists. The client will automatically enrich
+    /// that 404 with the unit that was sent to help diagnose the mismatch.
+    ///
     /// ```rust
     /// use runcycles::{WithCyclesConfig, models::Amount};
     /// let cfg = WithCyclesConfig::new(Amount::tokens(1000));

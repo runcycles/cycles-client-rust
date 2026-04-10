@@ -1,6 +1,6 @@
 # Protocol Conformance Audit — Rust Client
 
-- **Date:** 2026-04-02
+- **Date:** 2026-04-10
 - **Spec:** `cycles-protocol-v0.yaml` v0.1.24 (OpenAPI 3.1.0)
 - **Client:** Rust 1.88+ (MSRV), reqwest 0.12, serde 1, tokio 1, bon 3
 - **Cross-reference:** [cycles-server AUDIT.md](https://github.com/runcycles/cycles-server/blob/main/AUDIT.md)
@@ -170,6 +170,16 @@ The `ReservationGuard` RAII type (`src/guard.rs`) implements the reserve → exe
 
 ---
 
+## Issues Found & Resolved (0.2.3)
+
+1. **Misleading 404 on unit mismatch (issue [#8](https://github.com/runcycles/cycles-client-rust/issues/8))** — The spec defines `Balance` as *"Ledger state for a single **(scope, unit)** balance"* (`cycles-protocol-v0.yaml` line 667), so a single scope may hold multiple budgets keyed by unit. The reference server's `reserve.lua` implements this by keying budgets as `"budget:" .. scope .. ":" .. estimate_unit`. When a reservation targets a scope that has an active budget in a different unit (e.g. stored in `USD_MICROCENTS`, reserved in `TOKENS`), `reserve.lua` finds no matching key, returns `BUDGET_NOT_FOUND`, and the Java layer maps that to `HTTP 404 NOT_FOUND "Budget not found for provided scope: <scope>"`. The raw message reads like a scope-lookup miss, which led users to believe the scope didn't exist.
+
+   Note this surfaces two underlying spec issues on the **server** side (out of scope for the client, to be filed separately against `cycles-server`):
+   - The spec for `POST /v1/reservations` (lines 1187–1200) documents responses `200, 400, 401, 403, 409, 500` only — **no 404 is documented**, yet the server returns one here.
+   - The spec requires "Unit mismatch on commit ... or event (actual.unit not supported for the target scope) MUST return HTTP 400 with error=UNIT_MISMATCH" (line 56). The analogous rule for *reserve* is under-specified, and the server uses 404 `NOT_FOUND` instead of 400 `UNIT_MISMATCH`.
+
+   The **client** handles the server's out-of-spec response defensively and adds diagnostic context. **Fix:** `create_reservation`, `create_reservation_with_metadata`, `decide`, and `create_event` now post-process errors through `enrich_budget_not_found`, which detects the exact 404 marker and rewrites the `Error::Api.message` field to include the unit that was sent plus a one-line explanation of the `(scope, unit)` indexing invariant. All other `Error::Api` fields (`status`, `code`, `request_id`, `retry_after`, `details`) are preserved unchanged, so error classification, retry logic, request-id correlation, and downstream pattern matching behave identically. `Amount`, `WithCyclesConfig::new`, the `with_cycles_usage` example, and README Quick Start were updated to document the `(scope, unit)` invariant with reference to spec line 667.
+
 ## Issues Found & Resolved (0.2.2)
 
 1. **`BlockingCyclesClient::builder()` returned async builder** — `BlockingCyclesClient::builder()` returned `CyclesClientBuilder` whose `build()` produces `CyclesClient` (async), silently giving the wrong client type. **Fix:** removed `BlockingCyclesClient::builder()`; added `CyclesClientBuilder::build_blocking()` (feature-gated behind `blocking`) that returns `Result<BlockingCyclesClient, Error>`.
@@ -188,24 +198,28 @@ None. All endpoints, schemas, enums, headers, and validation constraints match t
 
 ## Test Coverage
 
-| Module               | Coverage |
-|----------------------|----------|
-| `models/enums.rs`    | 100%     |
-| `models/common.rs`   | 100%     |
-| `models/ids.rs`      | 100%     |
-| `models/request.rs`  | 100%     |
-| `validation.rs`      | 100%     |
-| `guard.rs`           | 100%     |
-| `config.rs`          | 100%     |
-| `lifecycle.rs`       | 100%     |
-| `client.rs`          | 95%      |
-| `response.rs`        | 96%      |
-| `retry.rs`           | 80%      |
-| `error.rs`           | 91%      |
-| `heartbeat.rs`       | 64%      |
-| **Overall**          | **95.3%**|
+Measured with `cargo tarpaulin --out Stdout --ignore-tests -- --skip live` on 2026-04-10 (clean build).
 
-141 total tests: 37 unit + 26 wiremock integration + 18 wire format compliance + 10 error + 10 config + 5 lifecycle + 4 guard lifecycle + 2 response + 1 retry + 12 live server (ignored by default) + 8 doc-tests.
+| Module               | Covered / Total | Coverage |
+|----------------------|-----------------|----------|
+| `config.rs`          | 72 / 72         | 100%     |
+| `error.rs`           | 30 / 30         | 100%     |
+| `lifecycle.rs`       | 47 / 47         | 100%     |
+| `models/common.rs`   | 26 / 26         | 100%     |
+| `models/enums.rs`    | 6 / 6           | 100%     |
+| `models/ids.rs`      | 14 / 14         | 100%     |
+| `models/request.rs`  | 13 / 13         | 100%     |
+| `response.rs`        | 24 / 24         | 100%     |
+| `validation.rs`      | 26 / 26         | 100%     |
+| `guard.rs`           | 44 / 45         | 97.78%   |
+| `client.rs`          | 137 / 143       | 95.80%   |
+| `retry.rs`           | 27 / 37         | 72.97%   |
+| `heartbeat.rs`       | 6 / 11          | 54.55%   |
+| **Overall**          | **472 / 494**   | **95.55%** |
+
+Uncovered lines are concentrated in `heartbeat.rs` background-task wiring and `retry.rs` backoff edge cases; both are exercised by the ignored `live_server_test` suite, which is not counted in the measurement above.
+
+143 total tests (131 running + 12 live-server ignored): 43 lib unit + 30 wiremock client integration + 18 wire format compliance + 10 error + 10 config + 5 lifecycle + 4 guard lifecycle + 2 response + 1 retry + 12 live server (ignored by default) + 8 doc-tests. The 0.2.3 release added 5 unit tests (`client::tests::enrich_budget_not_found_*`) and 4 wiremock integration tests (`create_reservation_404_*`, `decide_404_*`, `create_event_404_*`) for the issue #8 fix.
 
 ---
 

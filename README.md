@@ -19,6 +19,14 @@ idiomatic Rust API built around RAII guards and ownership semantics.
 runcycles = "0.2"
 ```
 
+> **Unit must match the budget.** The `Amount` you pass to `reserve`,
+> `with_cycles`, `decide`, or `create_event` must be in the same unit as the
+> active budget at the target scope. The server indexes budgets by
+> `(scope, unit)`, so reserving `Amount::tokens(…)` against a
+> `USD_MICROCENTS` budget returns a 404 *"Budget not found for provided
+> scope"* even though the scope exists. The client enriches such 404s with
+> the unit that was sent to make the mismatch obvious.
+
 ## Quick Start — Automatic Lifecycle (`with_cycles`)
 
 Like Python's `@cycles` decorator or TypeScript's `withCycles`. Reserve, execute,

@@ -14,6 +14,7 @@ use crate::constants::{
 };
 use crate::error::Error;
 use crate::guard::ReservationGuard;
+use crate::models::enums::Unit;
 use crate::models::request::{
     BalanceParams, CommitRequest, DecisionRequest, EventCreateRequest, ExtendRequest,
     ListReservationsParams, ReleaseRequest, ReservationCreateRequest,
@@ -26,6 +27,50 @@ use crate::models::response::{
 use crate::models::{ErrorCode, ReservationId};
 use crate::response::ApiResponse;
 use crate::validation;
+
+/// Marker prefix the server emits when a reservation targets a scope for which
+/// no budget exists at the requested unit. The server indexes budgets by the
+/// composite key `(scope, unit)`, so a scope that has an active budget in one
+/// unit (e.g. `USD_MICROCENTS`) surfaces as a `NOT_FOUND` when the client
+/// reserves in a different unit (e.g. `TOKENS`). The raw 404 message then
+/// reads like a plain scope-lookup miss, which is misleading. See issue #8.
+const BUDGET_NOT_FOUND_MARKER: &str = "Budget not found for provided scope";
+
+/// If `err` is a 404 `NOT_FOUND` whose message matches the server's
+/// "Budget not found for provided scope" pattern, enrich it with the unit that
+/// was sent so unit-mismatch cases are self-diagnosing.
+fn enrich_budget_not_found(err: Error, unit: Unit) -> Error {
+    match err {
+        Error::Api {
+            status: 404,
+            code: Some(ErrorCode::NotFound),
+            message,
+            request_id,
+            retry_after,
+            details,
+        } if message.starts_with(BUDGET_NOT_FOUND_MARKER) => {
+            let unit_wire = serde_json::to_string(&unit)
+                .ok()
+                .map(|s| s.trim_matches('"').to_string())
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            let enriched = format!(
+                "{message} (request was sent with unit={unit_wire}; \
+                 verify an ACTIVE budget exists at this scope AND unit — \
+                 the server indexes budgets by (scope, unit), so a mismatched \
+                 unit surfaces as a 404 NOT_FOUND)"
+            );
+            Error::Api {
+                status: 404,
+                code: Some(ErrorCode::NotFound),
+                message: enriched,
+                request_id,
+                retry_after,
+                details,
+            }
+        }
+        other => other,
+    }
+}
 
 /// Async client for the Cycles budget authority API.
 ///
@@ -167,6 +212,7 @@ impl CyclesClient {
     ) -> Result<ReservationCreateResponse, Error> {
         self.post_json(RESERVATIONS_PATH, req, Some(req.idempotency_key.as_str()))
             .await
+            .map_err(|e| enrich_budget_not_found(e, req.estimate.unit))
     }
 
     /// Create a reservation and return the response with metadata.
@@ -176,6 +222,7 @@ impl CyclesClient {
     ) -> Result<ApiResponse<ReservationCreateResponse>, Error> {
         self.post_json_with_metadata(RESERVATIONS_PATH, req, Some(req.idempotency_key.as_str()))
             .await
+            .map_err(|e| enrich_budget_not_found(e, req.estimate.unit))
     }
 
     /// Commit actual spend against a reservation.
@@ -215,6 +262,7 @@ impl CyclesClient {
     pub async fn decide(&self, req: &DecisionRequest) -> Result<DecisionResponse, Error> {
         self.post_json(DECIDE_PATH, req, Some(req.idempotency_key.as_str()))
             .await
+            .map_err(|e| enrich_budget_not_found(e, req.estimate.unit))
     }
 
     /// Create a direct-debit event (no prior reservation).
@@ -224,6 +272,7 @@ impl CyclesClient {
     ) -> Result<EventCreateResponse, Error> {
         self.post_json(EVENTS_PATH, req, Some(req.idempotency_key.as_str()))
             .await
+            .map_err(|e| enrich_budget_not_found(e, req.actual.unit))
     }
 
     /// List reservations with optional filters.
@@ -404,3 +453,101 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<CyclesClient>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enrich_budget_not_found_adds_unit_hint() {
+        let err = Error::Api {
+            status: 404,
+            code: Some(ErrorCode::NotFound),
+            message: "Budget not found for provided scope: tenant:rider".to_string(),
+            request_id: Some("req-1".to_string()),
+            retry_after: None,
+            details: None,
+        };
+        let enriched = enrich_budget_not_found(err, Unit::Tokens);
+        match enriched {
+            Error::Api {
+                status,
+                code,
+                message,
+                request_id,
+                ..
+            } => {
+                assert_eq!(status, 404);
+                assert_eq!(code, Some(ErrorCode::NotFound));
+                assert!(message.starts_with("Budget not found for provided scope: tenant:rider"));
+                assert!(message.contains("unit=TOKENS"));
+                assert!(message.contains("(scope, unit)"));
+                assert_eq!(request_id.as_deref(), Some("req-1"));
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enrich_budget_not_found_uses_wire_format_for_unit() {
+        let err = Error::Api {
+            status: 404,
+            code: Some(ErrorCode::NotFound),
+            message: "Budget not found for provided scope: tenant:acme".to_string(),
+            request_id: None,
+            retry_after: None,
+            details: None,
+        };
+        let enriched = enrich_budget_not_found(err, Unit::UsdMicrocents);
+        if let Error::Api { message, .. } = enriched {
+            assert!(message.contains("unit=USD_MICROCENTS"));
+        } else {
+            panic!("expected Api error");
+        }
+    }
+
+    #[test]
+    fn enrich_budget_not_found_ignores_non_matching_messages() {
+        let err = Error::Api {
+            status: 404,
+            code: Some(ErrorCode::NotFound),
+            message: "Reservation not found: rsv_xyz".to_string(),
+            request_id: None,
+            retry_after: None,
+            details: None,
+        };
+        let enriched = enrich_budget_not_found(err, Unit::Tokens);
+        if let Error::Api { message, .. } = enriched {
+            assert_eq!(message, "Reservation not found: rsv_xyz");
+            assert!(!message.contains("unit="));
+        } else {
+            panic!("expected Api error");
+        }
+    }
+
+    #[test]
+    fn enrich_budget_not_found_ignores_non_404_errors() {
+        let err = Error::Api {
+            status: 409,
+            code: Some(ErrorCode::NotFound),
+            message: "Budget not found for provided scope: tenant:rider".to_string(),
+            request_id: None,
+            retry_after: None,
+            details: None,
+        };
+        let enriched = enrich_budget_not_found(err, Unit::Tokens);
+        if let Error::Api { message, .. } = enriched {
+            // 409 is not enriched — only 404 NOT_FOUND with the server marker is
+            assert_eq!(message, "Budget not found for provided scope: tenant:rider");
+        } else {
+            panic!("expected Api error");
+        }
+    }
+
+    #[test]
+    fn enrich_budget_not_found_passes_through_other_error_kinds() {
+        let err = Error::Validation("bad input".to_string());
+        let enriched = enrich_budget_not_found(err, Unit::Tokens);
+        assert!(matches!(enriched, Error::Validation(msg) if msg == "bad input"));
+    }
+}

@@ -846,3 +846,158 @@ async fn unknown_error_code_does_not_crash() {
         _ => panic!("expected Api error"),
     }
 }
+
+// ─── 404 unit-mismatch diagnostic (issue #8) ──────────────────────
+
+/// When the server stores a budget at (scope=tenant:rider, unit=USD_MICROCENTS)
+/// but a reservation is sent in a different unit, the Lua script in
+/// `reserve.lua` reports `BUDGET_NOT_FOUND` because it indexes budgets by
+/// (scope, unit). The raw 404 message ("Budget not found for provided scope:
+/// tenant:rider") is misleading. The Rust client enriches it in-flight so the
+/// user sees which unit was actually sent.
+#[tokio::test]
+async fn create_reservation_404_budget_not_found_is_enriched_with_unit() {
+    let (server, client) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": "NOT_FOUND",
+            "message": "Budget not found for provided scope: tenant:rider",
+            "request_id": "req-abc-123"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let req = ReservationCreateRequest::builder()
+        .subject(Subject {
+            tenant: Some("rider".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::tokens(1000))
+        .build();
+
+    let err = client.create_reservation(&req).await.unwrap_err();
+    match err {
+        Error::Api {
+            status,
+            code,
+            message,
+            request_id,
+            ..
+        } => {
+            assert_eq!(status, 404);
+            assert_eq!(code, Some(ErrorCode::NotFound));
+            assert!(message.starts_with("Budget not found for provided scope: tenant:rider"));
+            assert!(
+                message.contains("unit=TOKENS"),
+                "expected enriched message to name the sent unit, got: {message}"
+            );
+            assert!(message.contains("(scope, unit)"));
+            assert_eq!(request_id.as_deref(), Some("req-abc-123"));
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn decide_404_budget_not_found_is_enriched_with_unit() {
+    let (server, client) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/decide"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": "NOT_FOUND",
+            "message": "Budget not found for provided scope: tenant:acme"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let req = DecisionRequest::builder()
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::credits(10))
+        .build();
+
+    let err = client.decide(&req).await.unwrap_err();
+    match err {
+        Error::Api { message, .. } => {
+            assert!(message.contains("unit=CREDITS"));
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn create_event_404_budget_not_found_is_enriched_with_unit() {
+    let (server, client) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": "NOT_FOUND",
+            "message": "Budget not found for provided scope: tenant:acme"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let req = EventCreateRequest::builder()
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .actual(Amount::risk_points(5))
+        .build();
+
+    let err = client.create_event(&req).await.unwrap_err();
+    match err {
+        Error::Api { message, .. } => {
+            assert!(message.contains("unit=RISK_POINTS"));
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}
+
+/// An unrelated 404 (e.g. a missing reservation path) must NOT be enriched —
+/// only messages matching the server's "Budget not found for provided scope"
+/// marker are rewritten.
+#[tokio::test]
+async fn create_reservation_404_other_not_found_is_not_enriched() {
+    let (server, client) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": "NOT_FOUND",
+            "message": "Tenant not found: ghost"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let req = ReservationCreateRequest::builder()
+        .subject(Subject {
+            tenant: Some("ghost".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::tokens(1000))
+        .build();
+
+    let err = client.create_reservation(&req).await.unwrap_err();
+    match err {
+        Error::Api { message, .. } => {
+            assert_eq!(message, "Tenant not found: ghost");
+            assert!(!message.contains("unit="));
+        }
+        other => panic!("expected Api error, got {other:?}"),
+    }
+}

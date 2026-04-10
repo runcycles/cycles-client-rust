@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.3] - 2026-04-10
+
+### Fixed
+
+- Misleading 404 on reserve/decide/event when the request unit does not match
+  the stored budget's unit ([#8](https://github.com/runcycles/cycles-client-rust/issues/8)).
+  The server indexes budgets by `(scope, unit)`, so reserving in the wrong
+  unit surfaces as `"Budget not found for provided scope: …"` even when the
+  scope itself has an ACTIVE budget. `create_reservation`,
+  `create_reservation_with_metadata`, `decide`, and `create_event` now
+  enrich such 404s in-flight with the unit that was sent, so the mismatch is
+  self-diagnosing. No behavioral change for other errors.
+
+### Docs
+
+- `Amount`, `WithCyclesConfig::new`, the `with_cycles_usage` example, and the
+  README Quick Start all note the `(scope, unit)` budget indexing invariant.
+
 ## [0.2.2] - 2026-04-02
 
 ### Fixed

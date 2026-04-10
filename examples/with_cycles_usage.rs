@@ -2,6 +2,12 @@
 //!
 //! This is the simplest way to integrate Cycles into existing LLM calls.
 //! Reserve, execute, and commit/release are handled automatically.
+//!
+//! **Unit must match the budget.** The `Amount` unit passed to
+//! `WithCyclesConfig::new` (and the `actual` returned by the closure) must
+//! match the unit of the active budget at the target scope. Budgets are
+//! indexed by `(scope, unit)` server-side, so a mismatched unit surfaces as a
+//! 404 "Budget not found for provided scope: …" — even when the scope exists.
 
 use runcycles::models::*;
 use runcycles::{with_cycles, CyclesClient, WithCyclesConfig};
