@@ -1,6 +1,6 @@
 # Protocol Conformance Audit — Rust Client
 
-- **Date:** 2026-04-02
+- **Date:** 2026-04-10
 - **Spec:** `cycles-protocol-v0.yaml` v0.1.24 (OpenAPI 3.1.0)
 - **Client:** Rust 1.88+ (MSRV), reqwest 0.12, serde 1, tokio 1, bon 3
 - **Cross-reference:** [cycles-server AUDIT.md](https://github.com/runcycles/cycles-server/blob/main/AUDIT.md)
@@ -169,6 +169,10 @@ The `ReservationGuard` RAII type (`src/guard.rs`) implements the reserve → exe
 - Tests verify: `"ALLOW_WITH_WARNINGS"` deserializes as `Decision::Unknown`, `"RATE_LIMITED"` as `ErrorCode::Unknown`, `"PENDING"` as `ReservationStatus::Unknown`
 
 ---
+
+## Issues Found & Resolved (0.2.3)
+
+1. **Misleading 404 on unit mismatch (issue [#8](https://github.com/runcycles/cycles-client-rust/issues/8))** — The server's `reserve.lua` keys budgets by `"budget:" .. scope .. ":" .. estimate_unit`. When a reservation targets a scope that has an active budget in a different unit (e.g. stored in `USD_MICROCENTS`, reserved in `TOKENS`), the script returns `BUDGET_NOT_FOUND` and the server maps that to `HTTP 404 NOT_FOUND "Budget not found for provided scope: <scope>"`. The raw message reads like a scope-lookup miss, which led users to believe the scope didn't exist. **Fix:** `create_reservation`, `create_reservation_with_metadata`, `decide`, and `create_event` now post-process errors through `enrich_budget_not_found`, which detects the exact 404 marker and rewrites the message to include the unit that was sent and a one-line explanation of the `(scope, unit)` indexing invariant. `Amount`, `WithCyclesConfig::new`, the `with_cycles_usage` example, and README Quick Start were updated to document the invariant.
 
 ## Issues Found & Resolved (0.2.2)
 

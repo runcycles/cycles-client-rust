@@ -7,6 +7,15 @@ use serde::{Deserialize, Serialize};
 use super::enums::Unit;
 
 /// A non-negative budget amount with a unit.
+///
+/// The `unit` must match the unit of the active budget at the target scope.
+/// Budgets are indexed server-side by `(scope, unit)`, so submitting an
+/// `Amount` in a different unit than the stored budget returns a
+/// `404 NOT_FOUND` ("Budget not found for provided scope: …") — even when
+/// the scope itself exists. Prefer the typed constructors
+/// ([`Amount::tokens`], [`Amount::usd_microcents`], [`Amount::credits`],
+/// [`Amount::risk_points`]) and match them against the unit the budget was
+/// allocated in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Amount {
     /// The unit of measurement.
