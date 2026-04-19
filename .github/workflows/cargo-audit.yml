@@ -1,0 +1,53 @@
+name: Cargo Audit
+
+# Rust supply-chain coverage via RustSec advisory database. Fills the gap
+# that CodeQL leaves — CodeQL has no Rust analyzer, so default-setup runs
+# but produces no findings regardless of what's in Cargo.lock. cargo-audit
+# is the ecosystem-standard check against rustsec/advisory-db.
+#
+# Triggers:
+# - Cargo.lock / Cargo.toml changes on PRs: catches new vulnerable deps
+#   before merge.
+# - Push to main with the same path filter: belt-and-suspenders if an
+#   admin bypass lands a direct push.
+# - Weekly schedule: catches newly-announced CVEs against an unchanged
+#   Cargo.lock. This is the most valuable trigger — most Rust supply-chain
+#   alerts come from advisories published after the code was written.
+# - workflow_dispatch: manual re-check.
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - '.github/workflows/cargo-audit.yml'
+  push:
+    branches: [main, master]
+    paths:
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # taiki-e/install-action fetches a pre-built cargo-audit binary,
+      # ~5s instead of the ~90s a `cargo install --locked cargo-audit`
+      # takes from source. Matters for the weekly cron — keeps the
+      # run cheap enough to not matter.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit --deny warnings

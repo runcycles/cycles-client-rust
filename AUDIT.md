@@ -1,9 +1,10 @@
 # Protocol Conformance Audit — Rust Client
 
-- **Date:** 2026-04-10
+- **Date:** 2026-04-10 (protocol conformance), 2026-04-19 (supply-chain coverage — cargo-audit workflow added)
 - **Spec:** `cycles-protocol-v0.yaml` v0.1.24 (OpenAPI 3.1.0)
 - **Client:** Rust 1.88+ (MSRV), reqwest 0.12, serde 1, tokio 1, bon 3
 - **Cross-reference:** [cycles-server AUDIT.md](https://github.com/runcycles/cycles-server/blob/main/AUDIT.md)
+- **Supply-chain coverage:** `.github/workflows/cargo-audit.yml` runs `cargo audit` against rustsec/advisory-db on PRs touching `Cargo.lock` / `Cargo.toml`, on push to `main`, and weekly (Monday 06:00 UTC). Fills the gap left by CodeQL default-setup, which has no Rust analyzer.
 
 ---
 
