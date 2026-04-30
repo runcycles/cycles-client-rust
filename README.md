@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](https://github.com/runcycles/cycles-client-rust/actions)
 
-# Cycles Rust Client
+# Cycles Rust Client — AI agent budget and action authority SDK
 
 Rust client for the [Cycles](https://runcycles.io) budget-management protocol — deterministic spend control for AI agents and LLM workflows.
 
