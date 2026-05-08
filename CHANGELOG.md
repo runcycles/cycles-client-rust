@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.4] - 2026-05-08
+
+### Changed
+
+- Crates.io description and keywords broadened to cover the three pillars of
+  Cycles' runtime authority: spend, risky tool actions, and audit gaps. Prior
+  framing ("budget-management protocol — deterministic spend control") only
+  surfaced the spend dimension and missed search-intent traffic for action
+  control and audit-trail use cases.
+- Keyword set updated from `["cycles", "budget", "llm", "ai-agents",
+  "cost-control"]` to `["ai-agents", "llm", "budget", "governance",
+  "audit-log"]`. Same five-keyword cap, broader coverage.
+- `README.md` opening reorganized around the three pillars (spend / risky
+  actions / audit gaps), each with a one-line concrete affordance, instead
+  of leading with budget enforcement only.
+
+No behavioral changes. API surface, wire protocol, and conformance audit
+results are identical to 0.2.3.
+
 ## [0.2.3] - 2026-04-10
 
 ### Fixed
