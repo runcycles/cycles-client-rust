@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "runcycles"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bon",
  "pretty_assertions",
