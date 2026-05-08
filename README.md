@@ -4,13 +4,15 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](https://github.com/runcycles/cycles-client-rust/actions)
 
-# Cycles Rust Client — AI agent budget and action authority SDK
+# Cycles Rust Client — Runtime Authority for AI Agents (Spend, Actions, Audit)
 
-Rust client for the [Cycles](https://runcycles.io) budget-management protocol — deterministic spend control for AI agents and LLM workflows.
+Tokio-native Rust client for the [Cycles](https://runcycles.io) protocol — runtime authority over autonomous AI agents. Cycles enforces hard limits on three things observation alone can't fix:
 
-Cycles provides concurrency-safe spend and action control for autonomous agent
-runtimes. This crate implements the reserve-execute-commit lifecycle with an
-idiomatic Rust API built around RAII guards and ownership semantics.
+- **Spend** — reserve-commit budget enforcement that stops runaway LLM cost *before* the next call, not after the invoice arrives.
+- **Risky actions** — three-way decisions (`Allow` / `AllowWithCaps` / `Deny`) with caps for tool denylists, max tokens, max steps, and cooldowns. The client enforces caps before the agent acts.
+- **Audit gaps** — every reservation, commit, release, and decision is a signed event. Compliance, incident review, and per-agent attribution come for free, not as a separate logging project.
+
+This crate implements the reserve-execute-commit lifecycle with an idiomatic Rust API built around RAII guards, ownership semantics, and `Send + Sync` concurrency. Same wire protocol as the Python, TypeScript, and Spring Boot clients — switch languages without changing the server.
 
 ## Installation
 
