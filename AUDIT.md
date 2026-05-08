@@ -1,6 +1,6 @@
 # Protocol Conformance Audit — Rust Client
 
-- **Date:** 2026-04-10 (protocol conformance), 2026-04-19 (supply-chain coverage — cargo-audit workflow added)
+- **Date:** 2026-04-10 (protocol conformance), 2026-04-19 (supply-chain coverage — cargo-audit workflow added), 2026-05-08 (crates.io metadata refresh — description and keywords broadened to cover spend / risk / audit, no behavioral changes)
 - **Spec:** `cycles-protocol-v0.yaml` v0.1.24 (OpenAPI 3.1.0)
 - **Client:** Rust 1.88+ (MSRV), reqwest 0.12, serde 1, tokio 1, bon 3
 - **Cross-reference:** [cycles-server AUDIT.md](https://github.com/runcycles/cycles-server/blob/main/AUDIT.md)
