@@ -36,7 +36,7 @@
 //! for the guard-based pattern.
 
 use async_openai::{
-    types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs},
+    types::chat::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs},
     Client,
 };
 use runcycles::models::*;
