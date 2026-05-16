@@ -62,7 +62,7 @@ async fn main() -> Result<(), runcycles::Error> {
 # async fn call_llm(_: &str) -> String { "hi".into() }
 ```
 
-> **Want a real LLM example?** [`examples/async_openai_completion.rs`](examples/async_openai_completion.rs) wires the same `with_cycles` flow against `async-openai`, threading the response's `usage.total_tokens` back into the commit so the budget reflects actual spend. Run it with `cargo run --example async_openai_completion` (requires `OPENAI_API_KEY`).
+> **Want a real LLM example?** [`examples/async_openai_completion.rs`](examples/async_openai_completion.rs) wires the same `with_cycles` flow against `async-openai`, threading the response's `usage.total_tokens` back into the commit. Run it with `cargo run --example async_openai_completion` — requires `OPENAI_API_KEY` in the env plus a reachable Cycles server, a tenant API key, and a `TOKENS`-denominated budget at the scope the example reserves against.
 
 ## Manual Control — RAII Guard
 
