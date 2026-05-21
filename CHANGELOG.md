@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.5] - 2026-05-21
+
+`from` / `to` ISO-8601 window-filter fields on `ListReservationsParams`. Implements `cycles-protocol-v0.yaml` revision 2026-05-21 ([runcycles/cycles-protocol#97](https://github.com/runcycles/cycles-protocol/pull/97)) on the client side; runcycles/cycles-server#160 ships the server impl. Closes the Rust-client side of runcycles/cycles-server#159.
+
+### Added
+
+- `ListReservationsParams::from` and `::to` (`Option<String>`, ISO 8601 date-time). Both are inclusive bounds on `created_at_ms`. Either may be supplied alone (open interval) or together (closed window). The filter binds to `created_at_ms` regardless of any sort key. Servers reject `from > to` with HTTP 400 `INVALID_REQUEST`.
+- Regression test `list_reservations_forwards_from_to_window` in `tests/client_test.rs` using wiremock `query_param` matchers to assert that the new fields land on the wire under the spec-mandated query-string names.
+
+### Notes
+
+- Pure additive struct change for callers using `ListReservationsParams::default()` or struct-update syntax `..Default::default()` — the new fields default to `None` and serialize as absent.
+- **Source-level breakage for exhaustive constructors.** `ListReservationsParams` is not `#[non_exhaustive]`, so downstream callers who construct it field-by-field without `..Default::default()` (e.g. `let p = ListReservationsParams { status, tenant, app, agent, cursor, limit };`) will need to add `from: None, to: None` or switch to the `..Default::default()` shape. Mirrors the previous additive bumps to this struct.
+- 134 tests pass across the integration + unit suites; doc-tests + clippy clean.
+
 ## [0.2.4] - 2026-05-08
 
 ### Changed
