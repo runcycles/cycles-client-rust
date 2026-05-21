@@ -15,7 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Notes
 
-- Pure additive struct change. Callers using `ListReservationsParams::default()` or struct-update syntax `..Default::default()` continue to compile and behave identically; the new fields default to `None`.
+- Pure additive struct change for callers using `ListReservationsParams::default()` or struct-update syntax `..Default::default()` — the new fields default to `None` and serialize as absent.
+- **Source-level breakage for exhaustive constructors.** `ListReservationsParams` is not `#[non_exhaustive]`, so downstream callers who construct it field-by-field without `..Default::default()` (e.g. `let p = ListReservationsParams { status, tenant, app, agent, cursor, limit };`) will need to add `from: None, to: None` or switch to the `..Default::default()` shape. Mirrors the previous additive bumps to this struct.
 - 134 tests pass across the integration + unit suites; doc-tests + clippy clean.
 
 ## [0.2.4] - 2026-05-08
