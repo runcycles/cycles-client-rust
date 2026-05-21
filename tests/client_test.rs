@@ -3,7 +3,7 @@
 use runcycles::models::*;
 use runcycles::{CyclesClient, Error};
 use serde_json::json;
-use wiremock::matchers::{header, method, path, path_regex};
+use wiremock::matchers::{header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn setup() -> (MockServer, CyclesClient) {
@@ -410,6 +410,36 @@ async fn list_reservations_success() {
     assert_eq!(resp.reservations[0].reservation_id.as_str(), "rsv_1");
     assert_eq!(resp.reservations[0].status, ReservationStatus::Active);
     assert_eq!(resp.has_more, Some(false));
+}
+
+#[tokio::test]
+async fn list_reservations_forwards_from_to_window() {
+    // cycles-protocol-v0.yaml revision 2026-05-21: new `from` / `to` query
+    // params on listReservations. Both are ISO-8601 date-time strings,
+    // inclusive bounds on the reservation's `created_at_ms`. The mock matchers
+    // assert the params land on the wire under the spec-mandated names.
+    let (server, client) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/reservations"))
+        .and(query_param("from", "2026-05-21T00:00:00Z"))
+        .and(query_param("to", "2026-05-22T00:00:00Z"))
+        .and(query_param("tenant", "acme"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "reservations": [],
+            "has_more": false
+        })))
+        .mount(&server)
+        .await;
+
+    let params = ListReservationsParams {
+        tenant: Some("acme".to_string()),
+        from: Some("2026-05-21T00:00:00Z".to_string()),
+        to: Some("2026-05-22T00:00:00Z".to_string()),
+        ..Default::default()
+    };
+    let resp = client.list_reservations(&params).await.unwrap();
+    assert_eq!(resp.reservations.len(), 0);
 }
 
 // ─── get_reservation ─────────────────────────────────────────────

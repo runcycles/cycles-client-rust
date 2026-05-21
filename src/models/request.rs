@@ -153,6 +153,17 @@ pub struct ListReservationsParams {
     /// Filter by agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Inclusive lower bound on `created_at_ms`. ISO 8601 date-time.
+    /// Per cycles-protocol-v0.yaml revision 2026-05-21: the filter always
+    /// binds to `created_at_ms` regardless of any sort key; may be supplied
+    /// alone (open upper bound) or paired with `to`.
+    #[serde(rename = "from", skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Inclusive upper bound on `created_at_ms`. ISO 8601 date-time.
+    /// Same binding and open-interval rules as [`from`]. Servers reject
+    /// `from > to` with HTTP 400 INVALID_REQUEST.
+    #[serde(rename = "to", skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
     /// Cursor for pagination.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,

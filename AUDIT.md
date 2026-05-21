@@ -1,7 +1,7 @@
 # Protocol Conformance Audit — Rust Client
 
-- **Date:** 2026-04-10 (protocol conformance), 2026-04-19 (supply-chain coverage — cargo-audit workflow added), 2026-05-08 (crates.io metadata refresh — description and keywords broadened to cover spend / risk / audit, no behavioral changes)
-- **Spec:** `cycles-protocol-v0.yaml` v0.1.24 (OpenAPI 3.1.0)
+- **Date:** 2026-05-21 (v0.2.5 — `from` / `to` ISO-8601 window-filter fields added to `ListReservationsParams` per `cycles-protocol-v0.yaml` revision 2026-05-21; closes the Rust-client side of runcycles/cycles-server#159. Both `Option<String>`, both inclusive bounds on `created_at_ms`, both serialize via `#[serde(rename = "...")]` to land on the wire under the spec-mandated names. Pure additive struct change — callers using `Default::default()` or struct-update syntax stay compile-clean. Wire-format regression test added using wiremock's `query_param` matcher. 134 tests pass; clippy + doc-tests clean.), 2026-04-10 (protocol conformance), 2026-04-19 (supply-chain coverage — cargo-audit workflow added), 2026-05-08 (crates.io metadata refresh — description and keywords broadened to cover spend / risk / audit, no behavioral changes)
+- **Spec:** `cycles-protocol-v0.yaml` v0.1.25 (OpenAPI 3.1.0)
 - **Client:** Rust 1.88+ (MSRV), reqwest 0.12, serde 1, tokio 1, bon 3
 - **Cross-reference:** [cycles-server AUDIT.md](https://github.com/runcycles/cycles-server/blob/main/AUDIT.md)
 - **Supply-chain coverage:** `.github/workflows/cargo-audit.yml` runs `cargo audit` against rustsec/advisory-db on PRs touching `Cargo.lock` / `Cargo.toml`, on push to `main`, and weekly (Monday 06:00 UTC). Fills the gap left by CodeQL default-setup, which has no Rust analyzer.
