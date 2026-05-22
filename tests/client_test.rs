@@ -508,7 +508,10 @@ async fn list_reservations_deserializes_finalized_at_ms_on_summary() {
     let params = ListReservationsParams::default();
     let resp = client.list_reservations(&params).await.unwrap();
     assert_eq!(resp.reservations.len(), 1);
-    assert_eq!(resp.reservations[0].finalized_at_ms, Some(1700000050000_u64));
+    assert_eq!(
+        resp.reservations[0].finalized_at_ms,
+        Some(1700000050000_u64)
+    );
 }
 
 #[tokio::test]
