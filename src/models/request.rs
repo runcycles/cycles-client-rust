@@ -167,6 +167,33 @@ pub struct ListReservationsParams {
     /// query-string key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// Inclusive lower bound on `expires_at_ms`. ISO 8601 date-time.
+    /// Per cycles-protocol-v0.yaml revision 2026-05-22: the filter binds
+    /// to `expires_at_ms` independent of [`from`] / [`to`] and of any
+    /// `sort_by`. Applies to every row since `expires_at_ms` is required.
+    /// May be supplied alone or paired with [`expires_to`]. Servers
+    /// reject `expires_from > expires_to` with HTTP 400 INVALID_REQUEST.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_from: Option<String>,
+    /// Inclusive upper bound on `expires_at_ms`. ISO 8601 date-time.
+    /// Same binding and open-interval rules as [`expires_from`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_to: Option<String>,
+    /// Inclusive lower bound on `finalized_at_ms`. ISO 8601 date-time.
+    /// Per cycles-protocol-v0.yaml revision 2026-05-22: the filter binds
+    /// to `finalized_at_ms`, which is populated only on COMMITTED and
+    /// RELEASED rows. ACTIVE and EXPIRED rows are normatively excluded
+    /// from results when this is set (their `finalized_at_ms` is absent
+    /// so the predicate fails). Callers who want a window over EXPIRED
+    /// rows should use [`expires_from`] / [`expires_to`] instead.
+    /// Servers reject `finalized_from > finalized_to` with HTTP 400.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finalized_from: Option<String>,
+    /// Inclusive upper bound on `finalized_at_ms`. ISO 8601 date-time.
+    /// Same binding, open-interval, and ACTIVE/EXPIRED exclusion rules
+    /// as [`finalized_from`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finalized_to: Option<String>,
     /// Cursor for pagination.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,

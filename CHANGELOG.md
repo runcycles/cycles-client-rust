@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.6] - 2026-05-22
+
+`expires_*` / `finalized_*` ISO-8601 window-filter fields on `ListReservationsParams`, plus optional `finalized_at_ms` on `ReservationSummary`. Implements `cycles-protocol-v0.yaml` revision 2026-05-22 ([runcycles/cycles-protocol#98](https://github.com/runcycles/cycles-protocol/pull/98)) on the client side; runcycles/cycles-server#163 ships the server impl. Closes the Rust-client side of runcycles/cycles-server#162.
+
+### Added
+
+- `ListReservationsParams::expires_from`, `::expires_to`, `::finalized_from`, `::finalized_to` (`Option<String>`, ISO 8601 date-time). Each pair binds to its target field (`expires_at_ms`, `finalized_at_ms`) independent of `from`/`to` and of any `sort_by`. The three windows compose with AND semantics. `finalized_*` excludes ACTIVE and EXPIRED rows per the spec (field absent → predicate fails).
+- `ReservationSummary::finalized_at_ms` (`Option<u64>`). Populated by servers on COMMITTED and RELEASED rows; absent (deserialized as `None`) on ACTIVE/EXPIRED and on pre-v0.1.25.21 servers regardless of status. `#[serde(default)]` keeps deserialization back-compatible.
+- Three regression tests under `tests/client_test.rs`:
+  - `list_reservations_forwards_expires_and_finalized_windows`: wiremock `query_param` matchers assert all four new fields land on the wire under their spec-mandated names.
+  - `list_reservations_deserializes_finalized_at_ms_on_summary`: confirms the field deserializes to `Some(value)` when the server emits it.
+  - `list_reservations_deserializes_absent_finalized_at_ms_as_none`: confirms back-compat with servers that don't emit the field.
+
+### Notes
+
+- Pure additive struct change for callers using `ListReservationsParams::default()` or `..Default::default()`.
+- **Source-level breakage for exhaustive constructors.** `ListReservationsParams` is not `#[non_exhaustive]`, so downstream callers who construct it field-by-field will need to add `expires_from: None, expires_to: None, finalized_from: None, finalized_to: None` or switch to `..Default::default()`. Mirrors the v0.2.5 additive bump.
+- `ReservationSummary` is `#[non_exhaustive]` (and `Deserialize`-only — callers can't construct it directly), so the new field is fully transparent.
+- 134 tests pass across the integration + unit suites; doc-tests + clippy clean.
+
 ## [0.2.5] - 2026-05-21
 
 `from` / `to` ISO-8601 window-filter fields on `ListReservationsParams`. Implements `cycles-protocol-v0.yaml` revision 2026-05-21 ([runcycles/cycles-protocol#97](https://github.com/runcycles/cycles-protocol/pull/97)) on the client side; runcycles/cycles-server#160 ships the server impl. Closes the Rust-client side of runcycles/cycles-server#159.
