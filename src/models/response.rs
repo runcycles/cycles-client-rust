@@ -175,6 +175,18 @@ pub struct ReservationSummary {
     pub created_at_ms: u64,
     /// When the reservation expires (Unix ms).
     pub expires_at_ms: u64,
+    /// When the reservation reached a terminal state (Unix ms).
+    /// Per cycles-protocol-v0.yaml revision 2026-05-22: populated on
+    /// COMMITTED and RELEASED rows only; absent on ACTIVE and EXPIRED.
+    /// Added to ReservationSummary in revision 2026-05-22 to support
+    /// the `finalized_from` / `finalized_to` window filter — callers
+    /// filtering on finalization time can see the timestamp directly
+    /// in list results without a follow-up `get_reservation` call.
+    /// Servers older than v0.1.25.21 do not emit this field; the
+    /// `Option` + `#[serde(default)]` make the deserialization
+    /// back-compatible.
+    #[serde(default)]
+    pub finalized_at_ms: Option<u64>,
     /// The fully qualified scope path.
     pub scope_path: String,
     /// Scopes affected.

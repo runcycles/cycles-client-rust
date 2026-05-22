@@ -442,6 +442,112 @@ async fn list_reservations_forwards_from_to_window() {
     assert_eq!(resp.reservations.len(), 0);
 }
 
+#[tokio::test]
+async fn list_reservations_forwards_expires_and_finalized_windows() {
+    // cycles-protocol-v0.yaml revision 2026-05-22: new `expires_from`/
+    // `expires_to` and `finalized_from`/`finalized_to` query params on
+    // listReservations. Mock matchers assert all four land on the wire
+    // under the spec-mandated names, distinct from `from`/`to`.
+    let (server, client) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/reservations"))
+        .and(query_param("tenant", "acme"))
+        .and(query_param("expires_from", "2026-05-22T00:00:00Z"))
+        .and(query_param("expires_to", "2026-05-23T00:00:00Z"))
+        .and(query_param("finalized_from", "2026-05-15T00:00:00Z"))
+        .and(query_param("finalized_to", "2026-05-22T00:00:00Z"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "reservations": [],
+            "has_more": false
+        })))
+        .mount(&server)
+        .await;
+
+    let params = ListReservationsParams {
+        tenant: Some("acme".to_string()),
+        expires_from: Some("2026-05-22T00:00:00Z".to_string()),
+        expires_to: Some("2026-05-23T00:00:00Z".to_string()),
+        finalized_from: Some("2026-05-15T00:00:00Z".to_string()),
+        finalized_to: Some("2026-05-22T00:00:00Z".to_string()),
+        ..Default::default()
+    };
+    let resp = client.list_reservations(&params).await.unwrap();
+    assert_eq!(resp.reservations.len(), 0);
+}
+
+#[tokio::test]
+async fn list_reservations_deserializes_finalized_at_ms_on_summary() {
+    // cycles-protocol-v0.yaml revision 2026-05-22: ReservationSummary gains
+    // an optional finalized_at_ms field. Verify the client deserializes it
+    // correctly on rows where the server emits it.
+    let (server, client) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/reservations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "reservations": [
+                {
+                    "reservation_id": "rsv_1",
+                    "status": "COMMITTED",
+                    "subject": {"tenant": "acme"},
+                    "action": {"kind": "llm.completion", "name": "gpt-4o"},
+                    "reserved": {"unit": "USD_MICROCENTS", "amount": 5000},
+                    "created_at_ms": 1700000000000_u64,
+                    "expires_at_ms": 1700000060000_u64,
+                    "finalized_at_ms": 1700000050000_u64,
+                    "scope_path": "tenant:acme",
+                    "affected_scopes": ["tenant:acme"]
+                }
+            ],
+            "has_more": false
+        })))
+        .mount(&server)
+        .await;
+
+    let params = ListReservationsParams::default();
+    let resp = client.list_reservations(&params).await.unwrap();
+    assert_eq!(resp.reservations.len(), 1);
+    assert_eq!(
+        resp.reservations[0].finalized_at_ms,
+        Some(1700000050000_u64)
+    );
+}
+
+#[tokio::test]
+async fn list_reservations_deserializes_absent_finalized_at_ms_as_none() {
+    // Back-compat: pre-v0.1.25.21 servers (and ACTIVE/EXPIRED rows on
+    // current servers) don't emit finalized_at_ms. #[serde(default)]
+    // must deserialize the absent field to None.
+    let (server, client) = setup().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/reservations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "reservations": [
+                {
+                    "reservation_id": "rsv_1",
+                    "status": "ACTIVE",
+                    "subject": {"tenant": "acme"},
+                    "action": {"kind": "llm.completion", "name": "gpt-4o"},
+                    "reserved": {"unit": "USD_MICROCENTS", "amount": 5000},
+                    "created_at_ms": 1700000000000_u64,
+                    "expires_at_ms": 1700000060000_u64,
+                    "scope_path": "tenant:acme",
+                    "affected_scopes": ["tenant:acme"]
+                }
+            ],
+            "has_more": false
+        })))
+        .mount(&server)
+        .await;
+
+    let params = ListReservationsParams::default();
+    let resp = client.list_reservations(&params).await.unwrap();
+    assert_eq!(resp.reservations.len(), 1);
+    assert_eq!(resp.reservations[0].finalized_at_ms, None);
+}
+
 // ─── get_reservation ─────────────────────────────────────────────
 
 #[tokio::test]
