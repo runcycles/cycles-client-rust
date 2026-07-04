@@ -183,10 +183,23 @@ impl CyclesClient {
             });
         }
 
-        let reservation_id = resp
-            .reservation_id
-            .clone()
-            .expect("reservation_id must be present when decision is ALLOW");
+        // Spec: reservation_id is present when decision is ALLOW /
+        // ALLOW_WITH_CAPS and dry_run=false. A missing id here means either
+        // a non-conformant server or a FUTURE decision value that
+        // deserialized to `Decision::Unknown` (the `#[serde(other)]`
+        // forward-compat arm) — neither may panic a caller. Fail with a
+        // typed error instead of `.expect(...)`.
+        let reservation_id = match resp.reservation_id.clone() {
+            Some(id) => id,
+            None => {
+                return Err(Error::Validation(format!(
+                    "server returned decision {:?} without a reservation_id; \
+                     cannot construct a reservation guard (unknown/additive \
+                     decision values are treated as non-allow)",
+                    resp.decision
+                )));
+            }
+        };
 
         let span = tracing::Span::current();
         span.record("cycles.reservation_id", reservation_id.as_str());
