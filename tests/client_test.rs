@@ -54,6 +54,46 @@ async fn create_reservation_success() {
 }
 
 #[tokio::test]
+async fn reserve_unknown_decision_without_reservation_id_errors_instead_of_panicking() {
+    // Regression (fleet audit 2026-07-04, issue #56 item 1): a FUTURE
+    // decision value deserializes to Decision::Unknown via #[serde(other)],
+    // bypasses the is_denied() check, and previously hit
+    // .expect("reservation_id must be present...") — panicking the caller.
+    // Forward-compat on the enum must extend to the control flow.
+    let (server, client) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "decision": "ALLOW_BUT_QUEUED",
+            "affected_scopes": ["tenant:acme"]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let req = ReservationCreateRequest::builder()
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::usd_microcents(5000))
+        .build();
+
+    let err = client
+        .reserve(req)
+        .await
+        .expect_err("must error, not panic");
+    match err {
+        Error::Validation(msg) => {
+            assert!(msg.contains("without a reservation_id"), "got: {msg}");
+        }
+        other => panic!("expected Error::Validation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn create_reservation_allow_with_caps() {
     let (server, client) = setup().await;
 
