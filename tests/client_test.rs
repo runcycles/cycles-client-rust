@@ -81,7 +81,10 @@ async fn reserve_unknown_decision_without_reservation_id_errors_instead_of_panic
         .estimate(Amount::usd_microcents(5000))
         .build();
 
-    let err = client.reserve(req).await.expect_err("must error, not panic");
+    let err = client
+        .reserve(req)
+        .await
+        .expect_err("must error, not panic");
     match err {
         Error::Validation(msg) => {
             assert!(msg.contains("without a reservation_id"), "got: {msg}");
