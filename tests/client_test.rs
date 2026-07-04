@@ -87,7 +87,47 @@ async fn reserve_unknown_decision_without_reservation_id_errors_instead_of_panic
         .expect_err("must error, not panic");
     match err {
         Error::Validation(msg) => {
-            assert!(msg.contains("without a reservation_id"), "got: {msg}");
+            assert!(msg.contains("unrecognized decision"), "got: {msg}");
+        }
+        other => panic!("expected Error::Validation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn reserve_unknown_decision_with_reservation_id_still_refuses_guard() {
+    // Review finding on the first fix: gating only on is_denied() meant an
+    // unknown decision WITH a reservation_id still built a guard — silently
+    // treating semantics this client does not understand as an allow.
+    // reserve() must gate on POSITIVE is_allowed().
+    let (server, client) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "decision": "ALLOW_BUT_QUEUED",
+            "reservation_id": "rsv_queued_1",
+            "affected_scopes": ["tenant:acme"]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let req = ReservationCreateRequest::builder()
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::usd_microcents(5000))
+        .build();
+
+    let err = client
+        .reserve(req)
+        .await
+        .expect_err("unknown decision must not yield a guard");
+    match err {
+        Error::Validation(msg) => {
+            assert!(msg.contains("unrecognized decision"), "got: {msg}");
         }
         other => panic!("expected Error::Validation, got {other:?}"),
     }

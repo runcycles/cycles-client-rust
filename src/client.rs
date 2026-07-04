@@ -183,19 +183,32 @@ impl CyclesClient {
             });
         }
 
+        // Gate on POSITIVE allowance, not merely non-denial: a FUTURE
+        // decision value deserializes to `Decision::Unknown` (the
+        // `#[serde(other)]` forward-compat arm), and treating it as an
+        // allow — even when a reservation_id happens to be present — would
+        // silently commit budget under semantics this client does not
+        // understand. Unknown decisions are non-allow by definition
+        // (`Decision::is_allowed()`).
+        if !resp.decision.is_allowed() {
+            return Err(Error::Validation(format!(
+                "server returned unrecognized decision {:?}; refusing to \
+                 construct a reservation guard (unknown/additive decision \
+                 values are treated as non-allow)",
+                resp.decision
+            )));
+        }
+
         // Spec: reservation_id is present when decision is ALLOW /
-        // ALLOW_WITH_CAPS and dry_run=false. A missing id here means either
-        // a non-conformant server or a FUTURE decision value that
-        // deserialized to `Decision::Unknown` (the `#[serde(other)]`
-        // forward-compat arm) — neither may panic a caller. Fail with a
-        // typed error instead of `.expect(...)`.
+        // ALLOW_WITH_CAPS and dry_run=false. A missing id on an allowed
+        // decision means a non-conformant server — fail with a typed error
+        // instead of panicking.
         let reservation_id = match resp.reservation_id.clone() {
             Some(id) => id,
             None => {
                 return Err(Error::Validation(format!(
                     "server returned decision {:?} without a reservation_id; \
-                     cannot construct a reservation guard (unknown/additive \
-                     decision values are treated as non-allow)",
+                     cannot construct a reservation guard",
                     resp.decision
                 )));
             }
