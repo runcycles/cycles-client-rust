@@ -65,7 +65,7 @@ fn client_is_clone() {
 #[test]
 fn client_is_debug() {
     let client = CyclesClient::builder("key", "http://localhost:7878").build();
-    let debug = format!("{:?}", client);
+    let debug = format!("{client:?}");
     assert!(debug.contains("CyclesClient"));
     assert!(debug.contains("localhost"));
 }

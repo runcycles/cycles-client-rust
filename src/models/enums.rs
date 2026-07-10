@@ -164,6 +164,20 @@ pub enum ErrorCode {
     DebtOutstanding,
     /// Maximum number of TTL extensions reached.
     MaxExtensionsExceeded,
+    /// The request was rate-limited (runtime spec v0.1.25.12).
+    ///
+    /// Returned with HTTP 429 (server-side throttling, e.g. on the public
+    /// evidence/JWKS endpoints) together with the `Retry-After` and
+    /// `X-RateLimit-Reset` headers. Transient — retry after the indicated
+    /// delay.
+    LimitExceeded,
+    /// The owning tenant is closed (runtime spec v0.1.25.13).
+    ///
+    /// Returned with HTTP 409 on reservation create/commit/release/extend
+    /// when the owning tenant's status is CLOSED (mirrors governance spec
+    /// Rule 2). Not retryable — the tenant must be reopened
+    /// administratively.
+    TenantClosed,
     /// An internal server error occurred.
     InternalError,
     /// An unknown error code from a newer protocol version.
@@ -173,8 +187,15 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Returns `true` if the error is retryable.
+    ///
+    /// `LimitExceeded` is HTTP 429 rate limiting (runtime spec v0.1.25.12):
+    /// transient by definition — the spec instructs clients to retry after
+    /// the indicated `Retry-After` delay.
     pub fn is_retryable(self) -> bool {
-        matches!(self, Self::InternalError | Self::Unknown)
+        matches!(
+            self,
+            Self::InternalError | Self::Unknown | Self::LimitExceeded
+        )
     }
 }
 
@@ -267,11 +288,13 @@ mod tests {
                 ErrorCode::MaxExtensionsExceeded,
                 "\"MAX_EXTENSIONS_EXCEEDED\"",
             ),
+            (ErrorCode::LimitExceeded, "\"LIMIT_EXCEEDED\""),
+            (ErrorCode::TenantClosed, "\"TENANT_CLOSED\""),
             (ErrorCode::InternalError, "\"INTERNAL_ERROR\""),
         ];
         for (variant, expected) in codes {
             let json = serde_json::to_string(&variant).unwrap();
-            assert_eq!(json, expected, "failed for {:?}", variant);
+            assert_eq!(json, expected, "failed for {variant:?}");
             let round: ErrorCode = serde_json::from_str(&json).unwrap();
             assert_eq!(round, variant);
         }
@@ -287,7 +310,10 @@ mod tests {
     fn error_code_retryable() {
         assert!(ErrorCode::InternalError.is_retryable());
         assert!(ErrorCode::Unknown.is_retryable());
+        // HTTP 429 rate limiting (runtime spec v0.1.25.12) is transient.
+        assert!(ErrorCode::LimitExceeded.is_retryable());
         assert!(!ErrorCode::BudgetExceeded.is_retryable());
+        assert!(!ErrorCode::TenantClosed.is_retryable());
         assert!(!ErrorCode::Forbidden.is_retryable());
         assert!(!ErrorCode::ReservationExpired.is_retryable());
     }

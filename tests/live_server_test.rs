@@ -110,7 +110,7 @@ async fn live_full_lifecycle_reserve_release() {
         .expect("reserve should succeed");
 
     let rsv_id = guard.reservation_id().clone();
-    println!("Reserved: {}", rsv_id);
+    println!("Reserved: {rsv_id}");
 
     // Release the reservation
     let release_resp = guard
@@ -156,7 +156,7 @@ async fn live_low_level_create_commit() {
         .reservation_id
         .expect("should have reservation_id");
     assert!(!create_resp.affected_scopes.is_empty());
-    println!("Created: {}", rsv_id);
+    println!("Created: {rsv_id}");
 
     // Commit via low-level API
     let commit_resp = client
@@ -293,7 +293,7 @@ async fn live_reserve_extend_commit() {
         .expect("reserve should succeed");
 
     let rsv_id = guard.reservation_id().clone();
-    println!("Reserved: {} (short TTL)", rsv_id);
+    println!("Reserved: {rsv_id} (short TTL)");
 
     // Manually extend
     guard.extend(30_000).await.expect("extend should succeed");
@@ -363,9 +363,9 @@ async fn live_auth_failure() {
             assert_eq!(*status, 401);
             assert_eq!(*code, Some(ErrorCode::Unauthorized));
         }
-        _ => panic!("expected Api error, got: {:?}", err),
+        _ => panic!("expected Api error, got: {err:?}"),
     }
-    println!("Auth failure handled correctly: {}", err);
+    println!("Auth failure handled correctly: {err}");
 }
 
 // ─── Guard auto-release on drop ──────────────────────────────────
@@ -389,7 +389,7 @@ async fn live_guard_drop_auto_releases() {
             .expect("reserve should succeed");
 
         rsv_id = guard.reservation_id().clone();
-        println!("Reserved: {} (will be dropped)", rsv_id);
+        println!("Reserved: {rsv_id} (will be dropped)");
         // Guard drops here without commit or release
     }
 

@@ -39,7 +39,7 @@ async fn main() {
         }) => {
             println!("Budget exceeded: {message}");
             if let Some(delay) = retry_after {
-                println!("Retry after: {:?}", delay);
+                println!("Retry after: {delay:?}");
             }
         }
         Err(Error::Api {

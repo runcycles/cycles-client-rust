@@ -85,6 +85,22 @@ impl Error {
             )
     }
 
+    /// Returns `true` if this is a tenant-closed error (`TENANT_CLOSED`).
+    ///
+    /// Servers return HTTP 409 `TENANT_CLOSED` on reservation
+    /// create/commit/release/extend when the owning tenant's status is
+    /// CLOSED (runtime spec v0.1.25.13, mirroring governance spec Rule 2).
+    /// Not retryable — the tenant must be reopened administratively.
+    pub fn is_tenant_closed(&self) -> bool {
+        matches!(
+            self,
+            Self::Api {
+                code: Some(ErrorCode::TenantClosed),
+                ..
+            }
+        )
+    }
+
     /// Returns the suggested retry delay, if any.
     pub fn retry_after(&self) -> Option<Duration> {
         match self {

@@ -238,6 +238,74 @@ async fn create_reservation_budget_exceeded() {
 }
 
 #[tokio::test]
+async fn create_reservation_tenant_closed() {
+    // Runtime spec v0.1.25.13: servers return HTTP 409 TENANT_CLOSED on
+    // reservation create/commit/release/extend when the owning tenant is
+    // CLOSED (mirrors governance spec Rule 2).
+    let (server, client) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "error": "TENANT_CLOSED",
+            "message": "Owning tenant acme is CLOSED",
+            "request_id": "req-err-tc"
+        })))
+        .mount(&server)
+        .await;
+
+    let req = ReservationCreateRequest::builder()
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::usd_microcents(1000))
+        .build();
+
+    let err = client.create_reservation(&req).await.unwrap_err();
+    // Not classified into the BudgetExceeded convenience variant — surfaces
+    // as Error::Api with the typed code.
+    assert!(err.is_tenant_closed());
+    assert!(!err.is_budget_exceeded());
+    assert!(!err.is_retryable());
+    assert_eq!(err.error_code(), Some(ErrorCode::TenantClosed));
+    assert_eq!(err.request_id(), Some("req-err-tc"));
+}
+
+#[tokio::test]
+async fn create_reservation_rate_limited() {
+    // Runtime spec v0.1.25.12: HTTP 429 rate-limit responses carry
+    // error=LIMIT_EXCEEDED and are transient (retryable).
+    let (server, client) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+            "error": "LIMIT_EXCEEDED",
+            "message": "Rate limit exceeded",
+            "request_id": "req-err-rl"
+        })))
+        .mount(&server)
+        .await;
+
+    let req = ReservationCreateRequest::builder()
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::usd_microcents(1000))
+        .build();
+
+    let err = client.create_reservation(&req).await.unwrap_err();
+    assert_eq!(err.error_code(), Some(ErrorCode::LimitExceeded));
+    assert!(err.is_retryable());
+    assert!(!err.is_budget_exceeded());
+    assert_eq!(err.request_id(), Some("req-err-rl"));
+}
+
+#[tokio::test]
 async fn create_reservation_server_error() {
     let (server, client) = setup().await;
 
@@ -704,7 +772,7 @@ async fn get_balances_requires_filter() {
         Error::Validation(msg) => {
             assert!(msg.contains("filter"));
         }
-        _ => panic!("expected Validation error, got {:?}", err),
+        _ => panic!("expected Validation error, got {err:?}"),
     }
 }
 
