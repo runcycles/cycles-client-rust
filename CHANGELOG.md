@@ -6,13 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-`TENANT_CLOSED` error-code support. Implements the runtime spec v0.1.25.13 revision of `cycles-protocol-v0.yaml` ([runcycles/cycles-protocol#125](https://github.com/runcycles/cycles-protocol/pull/125)), which adds `TENANT_CLOSED` to the ErrorCode enum: servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant is CLOSED (mirrors governance spec Rule 2).
+`TENANT_CLOSED` + `LIMIT_EXCEEDED` error-code support. `TENANT_CLOSED` implements the runtime spec v0.1.25.13 revision of `cycles-protocol-v0.yaml` ([runcycles/cycles-protocol#125](https://github.com/runcycles/cycles-protocol/pull/125)): servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant is CLOSED (mirrors governance spec Rule 2). `LIMIT_EXCEEDED` closes the same class of gap for the runtime spec v0.1.25.12 revision (2026-07-04): HTTP 429 rate-limit responses (public evidence/JWKS endpoints) carry `error=LIMIT_EXCEEDED` plus `Retry-After` / `X-RateLimit-Reset` headers.
 
 ### Added
 
 - `ErrorCode::TenantClosed` variant (serde string mapping `"TENANT_CLOSED"`). `ErrorCode` is `#[non_exhaustive]` with a `#[serde(other)] Unknown` arm, so this is source- and wire-compatible.
 - `Error::is_tenant_closed()` helper, mirroring `Error::is_budget_exceeded()`: matches `Error::Api { code: Some(ErrorCode::TenantClosed), .. }`.
 - Regression tests: serde roundtrip for the new variant (`src/models/enums.rs`), `Error` helper behavior (`tests/error_test.rs`), and a wiremock test pinning that a 409 `TENANT_CLOSED` body surfaces as `Error::Api` with the typed code — not the `BudgetExceeded` convenience variant — and is non-retryable (`tests/client_test.rs`).
+- `ErrorCode::LimitExceeded` variant (serde string `"LIMIT_EXCEEDED"`), added in spec declaration order (after `MaxExtensionsExceeded`; `TenantClosed` relocated after it so the enum mirrors the spec exactly). Classified **retryable** by `ErrorCode::is_retryable()` — 429 is transient and the spec instructs retry after the indicated delay; `Error::is_retryable()` picks this up via the code-based arm (the status-based arm only covers ≥500). This preserves the prior `#[serde(other)] Unknown → retryable` fallback behavior, now typed instead of accidental. Enum-only by design, matching the `BudgetFrozen`/`BudgetClosed` pattern: not a reservation-lifecycle denial, so no `Error` helper or 409 classification change. Serde roundtrip + `Error` retryability + wiremock 429 regression tests added.
 
 ### Notes
 

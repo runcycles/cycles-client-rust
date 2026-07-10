@@ -274,6 +274,38 @@ async fn create_reservation_tenant_closed() {
 }
 
 #[tokio::test]
+async fn create_reservation_rate_limited() {
+    // Runtime spec v0.1.25.12: HTTP 429 rate-limit responses carry
+    // error=LIMIT_EXCEEDED and are transient (retryable).
+    let (server, client) = setup().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+            "error": "LIMIT_EXCEEDED",
+            "message": "Rate limit exceeded",
+            "request_id": "req-err-rl"
+        })))
+        .mount(&server)
+        .await;
+
+    let req = ReservationCreateRequest::builder()
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::usd_microcents(1000))
+        .build();
+
+    let err = client.create_reservation(&req).await.unwrap_err();
+    assert_eq!(err.error_code(), Some(ErrorCode::LimitExceeded));
+    assert!(err.is_retryable());
+    assert!(!err.is_budget_exceeded());
+    assert_eq!(err.request_id(), Some("req-err-rl"));
+}
+
+#[tokio::test]
 async fn create_reservation_server_error() {
     let (server, client) = setup().await;
 

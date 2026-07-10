@@ -158,6 +158,26 @@ fn api_error_is_tenant_closed_via_code() {
 }
 
 #[test]
+fn api_error_limit_exceeded_is_retryable() {
+    // Runtime spec v0.1.25.12: HTTP 429 rate limiting carries
+    // error=LIMIT_EXCEEDED and is transient — retry after the
+    // indicated delay.
+    let err = Error::Api {
+        status: 429,
+        code: Some(ErrorCode::LimitExceeded),
+        message: "Rate limited".into(),
+        request_id: Some("req-rl".into()),
+        retry_after: Some(Duration::from_secs(3)),
+        details: None,
+    };
+    assert!(err.is_retryable());
+    assert!(!err.is_tenant_closed());
+    assert!(!err.is_budget_exceeded());
+    assert_eq!(err.error_code(), Some(ErrorCode::LimitExceeded));
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(3)));
+}
+
+#[test]
 fn tenant_closed_helper_false_for_other_variants() {
     let err = Error::Validation("bad input".into());
     assert!(!err.is_tenant_closed());

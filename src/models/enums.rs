@@ -150,13 +150,6 @@ pub enum ErrorCode {
     BudgetFrozen,
     /// The budget scope is closed.
     BudgetClosed,
-    /// The owning tenant is closed (runtime spec v0.1.25.13).
-    ///
-    /// Returned with HTTP 409 on reservation create/commit/release/extend
-    /// when the owning tenant's status is CLOSED (mirrors governance spec
-    /// Rule 2). Not retryable — the tenant must be reopened
-    /// administratively.
-    TenantClosed,
     /// The reservation has expired (TTL elapsed).
     ReservationExpired,
     /// The reservation has already been committed or released.
@@ -171,6 +164,20 @@ pub enum ErrorCode {
     DebtOutstanding,
     /// Maximum number of TTL extensions reached.
     MaxExtensionsExceeded,
+    /// The request was rate-limited (runtime spec v0.1.25.12).
+    ///
+    /// Returned with HTTP 429 (server-side throttling, e.g. on the public
+    /// evidence/JWKS endpoints) together with the `Retry-After` and
+    /// `X-RateLimit-Reset` headers. Transient — retry after the indicated
+    /// delay.
+    LimitExceeded,
+    /// The owning tenant is closed (runtime spec v0.1.25.13).
+    ///
+    /// Returned with HTTP 409 on reservation create/commit/release/extend
+    /// when the owning tenant's status is CLOSED (mirrors governance spec
+    /// Rule 2). Not retryable — the tenant must be reopened
+    /// administratively.
+    TenantClosed,
     /// An internal server error occurred.
     InternalError,
     /// An unknown error code from a newer protocol version.
@@ -180,8 +187,15 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Returns `true` if the error is retryable.
+    ///
+    /// `LimitExceeded` is HTTP 429 rate limiting (runtime spec v0.1.25.12):
+    /// transient by definition — the spec instructs clients to retry after
+    /// the indicated `Retry-After` delay.
     pub fn is_retryable(self) -> bool {
-        matches!(self, Self::InternalError | Self::Unknown)
+        matches!(
+            self,
+            Self::InternalError | Self::Unknown | Self::LimitExceeded
+        )
     }
 }
 
@@ -261,7 +275,6 @@ mod tests {
             (ErrorCode::BudgetExceeded, "\"BUDGET_EXCEEDED\""),
             (ErrorCode::BudgetFrozen, "\"BUDGET_FROZEN\""),
             (ErrorCode::BudgetClosed, "\"BUDGET_CLOSED\""),
-            (ErrorCode::TenantClosed, "\"TENANT_CLOSED\""),
             (ErrorCode::ReservationExpired, "\"RESERVATION_EXPIRED\""),
             (ErrorCode::ReservationFinalized, "\"RESERVATION_FINALIZED\""),
             (ErrorCode::IdempotencyMismatch, "\"IDEMPOTENCY_MISMATCH\""),
@@ -275,6 +288,8 @@ mod tests {
                 ErrorCode::MaxExtensionsExceeded,
                 "\"MAX_EXTENSIONS_EXCEEDED\"",
             ),
+            (ErrorCode::LimitExceeded, "\"LIMIT_EXCEEDED\""),
+            (ErrorCode::TenantClosed, "\"TENANT_CLOSED\""),
             (ErrorCode::InternalError, "\"INTERNAL_ERROR\""),
         ];
         for (variant, expected) in codes {
@@ -295,6 +310,8 @@ mod tests {
     fn error_code_retryable() {
         assert!(ErrorCode::InternalError.is_retryable());
         assert!(ErrorCode::Unknown.is_retryable());
+        // HTTP 429 rate limiting (runtime spec v0.1.25.12) is transient.
+        assert!(ErrorCode::LimitExceeded.is_retryable());
         assert!(!ErrorCode::BudgetExceeded.is_retryable());
         assert!(!ErrorCode::TenantClosed.is_retryable());
         assert!(!ErrorCode::Forbidden.is_retryable());
