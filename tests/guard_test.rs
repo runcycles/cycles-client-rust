@@ -97,7 +97,7 @@ async fn guard_debug_format() {
 
     let guard = client.reserve(make_reserve_request()).await.unwrap();
 
-    let debug = format!("{:?}", guard);
+    let debug = format!("{guard:?}");
     assert!(debug.contains("ReservationGuard"));
     assert!(debug.contains("rsv_test"));
     assert!(debug.contains("AllowWithCaps"));

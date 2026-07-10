@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+`TENANT_CLOSED` error-code support. Implements the runtime spec v0.1.25.13 revision of `cycles-protocol-v0.yaml` (PR pending in runcycles/cycles-protocol), which adds `TENANT_CLOSED` to the ErrorCode enum: servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant is CLOSED (mirrors governance spec Rule 2).
+
+### Added
+
+- `ErrorCode::TenantClosed` variant (serde string mapping `"TENANT_CLOSED"`). `ErrorCode` is `#[non_exhaustive]` with a `#[serde(other)] Unknown` arm, so this is source- and wire-compatible.
+- `Error::is_tenant_closed()` helper, mirroring `Error::is_budget_exceeded()`: matches `Error::Api { code: Some(ErrorCode::TenantClosed), .. }`.
+- Regression tests: serde roundtrip for the new variant (`src/models/enums.rs`), `Error` helper behavior (`tests/error_test.rs`), and a wiremock test pinning that a 409 `TENANT_CLOSED` body surfaces as `Error::Api` with the typed code — not the `BudgetExceeded` convenience variant — and is non-retryable (`tests/client_test.rs`).
+
+### Notes
+
+- Purely additive; no wire-format change. Before this release, a server returning `TENANT_CLOSED` deserialized to `ErrorCode::Unknown` via the `#[serde(other)]` forward-compat arm — deserialization never failed, but `ErrorCode::Unknown.is_retryable()` is `true`, so `Error::is_retryable()` reported a 409 TENANT_CLOSED as retryable. With this release the code is typed and correctly non-retryable.
+- The 409 classification in `client.rs` (BUDGET_EXCEEDED / OVERDRAFT_LIMIT_EXCEEDED / DEBT_OUTSTANDING → `Error::BudgetExceeded`) is intentionally unchanged: TENANT_CLOSED is a tenant-state error, not a budget-family error, and surfaces as `Error::Api`.
+
 ## [0.2.6] - 2026-05-22
 
 `expires_*` / `finalized_*` ISO-8601 window-filter fields on `ListReservationsParams`, plus optional `finalized_at_ms` on `ReservationSummary`. Implements `cycles-protocol-v0.yaml` revision 2026-05-22 ([runcycles/cycles-protocol#98](https://github.com/runcycles/cycles-protocol/pull/98)) on the client side; runcycles/cycles-server#163 ships the server impl. Closes the Rust-client side of runcycles/cycles-server#162.

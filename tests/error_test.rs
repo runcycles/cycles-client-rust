@@ -138,3 +138,35 @@ fn api_error_is_budget_exceeded_via_code() {
     };
     assert!(err.is_budget_exceeded());
 }
+
+#[test]
+fn api_error_is_tenant_closed_via_code() {
+    // Runtime spec v0.1.25.13: HTTP 409 TENANT_CLOSED when the owning
+    // tenant is CLOSED (mirrors governance spec Rule 2).
+    let err = Error::Api {
+        status: 409,
+        code: Some(ErrorCode::TenantClosed),
+        message: "Owning tenant is CLOSED".into(),
+        request_id: Some("req-tc".into()),
+        retry_after: None,
+        details: None,
+    };
+    assert!(err.is_tenant_closed());
+    assert!(!err.is_budget_exceeded());
+    assert!(!err.is_retryable());
+    assert_eq!(err.error_code(), Some(ErrorCode::TenantClosed));
+}
+
+#[test]
+fn tenant_closed_helper_false_for_other_variants() {
+    let err = Error::Validation("bad input".into());
+    assert!(!err.is_tenant_closed());
+
+    let budget = Error::BudgetExceeded {
+        message: "Over budget".into(),
+        affected_scopes: vec![],
+        retry_after: None,
+        request_id: None,
+    };
+    assert!(!budget.is_tenant_closed());
+}

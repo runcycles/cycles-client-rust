@@ -54,10 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    println!(
-        "Streamed: {} input + {} output tokens",
-        total_input_tokens, total_output_tokens
-    );
+    println!("Streamed: {total_input_tokens} input + {total_output_tokens} output tokens");
 
     Ok(())
 }

@@ -103,7 +103,7 @@ async fn with_cycles_error_releases_automatically() {
     let err = err.unwrap_err();
     match err {
         Error::Validation(msg) => assert!(msg.contains("guarded function failed")),
-        _ => panic!("expected Validation error, got: {:?}", err),
+        _ => panic!("expected Validation error, got: {err:?}"),
     }
 }
 

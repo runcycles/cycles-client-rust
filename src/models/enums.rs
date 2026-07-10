@@ -150,6 +150,13 @@ pub enum ErrorCode {
     BudgetFrozen,
     /// The budget scope is closed.
     BudgetClosed,
+    /// The owning tenant is closed (runtime spec v0.1.25.13).
+    ///
+    /// Returned with HTTP 409 on reservation create/commit/release/extend
+    /// when the owning tenant's status is CLOSED (mirrors governance spec
+    /// Rule 2). Not retryable — the tenant must be reopened
+    /// administratively.
+    TenantClosed,
     /// The reservation has expired (TTL elapsed).
     ReservationExpired,
     /// The reservation has already been committed or released.
@@ -254,6 +261,7 @@ mod tests {
             (ErrorCode::BudgetExceeded, "\"BUDGET_EXCEEDED\""),
             (ErrorCode::BudgetFrozen, "\"BUDGET_FROZEN\""),
             (ErrorCode::BudgetClosed, "\"BUDGET_CLOSED\""),
+            (ErrorCode::TenantClosed, "\"TENANT_CLOSED\""),
             (ErrorCode::ReservationExpired, "\"RESERVATION_EXPIRED\""),
             (ErrorCode::ReservationFinalized, "\"RESERVATION_FINALIZED\""),
             (ErrorCode::IdempotencyMismatch, "\"IDEMPOTENCY_MISMATCH\""),
@@ -271,7 +279,7 @@ mod tests {
         ];
         for (variant, expected) in codes {
             let json = serde_json::to_string(&variant).unwrap();
-            assert_eq!(json, expected, "failed for {:?}", variant);
+            assert_eq!(json, expected, "failed for {variant:?}");
             let round: ErrorCode = serde_json::from_str(&json).unwrap();
             assert_eq!(round, variant);
         }
@@ -288,6 +296,7 @@ mod tests {
         assert!(ErrorCode::InternalError.is_retryable());
         assert!(ErrorCode::Unknown.is_retryable());
         assert!(!ErrorCode::BudgetExceeded.is_retryable());
+        assert!(!ErrorCode::TenantClosed.is_retryable());
         assert!(!ErrorCode::Forbidden.is_retryable());
         assert!(!ErrorCode::ReservationExpired.is_retryable());
     }
