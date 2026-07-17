@@ -17,7 +17,7 @@ Commit-retry wiring fix, plus `TENANT_CLOSED` + `LIMIT_EXCEEDED` error-code supp
   - retries reuse the original `CommitRequest` (same idempotency key), so a commit that already landed server-side cannot double-charge.
 
   Under a persistent outage `commit()` blocks for the full backoff schedule; tune the `retry_*` knobs or set `retry_enabled(false)` for fail-fast single-attempt commits.
-- `Cargo.lock`: `quinn-proto` 0.11.14 → 0.11.16 for [RUSTSEC-2026-0185](https://rustsec.org/advisories/RUSTSEC-2026-0185) (remote memory exhaustion via unbounded out-of-order stream reassembly; transitive dependency).
+- `Cargo.lock`: `quinn-proto` 0.11.14 → 0.11.16 for [RUSTSEC-2026-0185](https://rustsec.org/advisories/RUSTSEC-2026-0185) (remote memory exhaustion via unbounded out-of-order stream reassembly) and `anyhow` 1.0.102 → 1.0.103 for [RUSTSEC-2026-0190](https://rustsec.org/advisories/RUSTSEC-2026-0190) (unsoundness in `Error::downcast_mut()`); both transitive dependencies, flagged by the `cargo audit --deny warnings` CI gate.
 
 `TENANT_CLOSED` + `LIMIT_EXCEEDED` error-code support. `TENANT_CLOSED` implements the runtime spec v0.1.25.13 revision of `cycles-protocol-v0.yaml` ([runcycles/cycles-protocol#125](https://github.com/runcycles/cycles-protocol/pull/125)): servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant is CLOSED (mirrors governance spec Rule 2). `LIMIT_EXCEEDED` closes the same class of gap for the runtime spec v0.1.25.12 revision (2026-07-04): HTTP 429 rate-limit responses (public evidence/JWKS endpoints) carry `error=LIMIT_EXCEEDED` plus `Retry-After` / `X-RateLimit-Reset` headers.
 
