@@ -43,6 +43,7 @@ use crate::heartbeat::start_heartbeat;
 use crate::models::request::{CommitRequest, ReleaseRequest};
 use crate::models::response::{CommitResponse, ReleaseResponse};
 use crate::models::{Caps, Decision, ReservationId};
+use crate::retry::CommitRetryEngine;
 
 /// RAII guard for a live budget reservation.
 ///
@@ -126,12 +127,42 @@ impl ReservationGuard {
 
     /// Commit actual spend against the reservation.
     ///
-    /// Consumes the guard, preventing double-commit at compile time. Stops
-    /// the heartbeat and records the actual cost.
+    /// Consumes the guard, preventing double-commit at compile time, and
+    /// records the actual cost.
+    ///
+    /// If the attempt fails with a retryable error — a transport failure, a
+    /// 5xx server error, or an error code the protocol classifies as
+    /// transient (see [`Error::is_retryable`]) — and
+    /// [`retry_enabled`](crate::config::CyclesConfig::retry_enabled) is set,
+    /// the commit is retried inline with exponential backoff, reusing the
+    /// same request — and therefore the same idempotency key, so a commit
+    /// that already landed server-side cannot double-charge. The heartbeat
+    /// keeps extending the reservation's TTL until the outcome is final, so
+    /// the reservation cannot expire mid-retry.
+    ///
+    /// The returned result is final: `Ok` means the spend was recorded;
+    /// `Err` means no further commit attempt will be made (the retry stopped
+    /// on a non-retryable error or exhausted
+    /// [`retry_max_attempts`](crate::config::CyclesConfig::retry_max_attempts)),
+    /// so the caller may safely compensate. Under a persistent outage this
+    /// call blocks for the full backoff schedule; tune the `retry_*` config
+    /// knobs or disable retry for fail-fast single-attempt commits.
     pub async fn commit(mut self, req: CommitRequest) -> Result<CommitResponse, Error> {
         self.finalized = true;
+        // The heartbeat is deliberately NOT cancelled yet: it must keep the
+        // reservation alive while retries run. Cancelled below once the
+        // outcome is final (Drop also cancels, as a backstop).
+        let result = match self.client.commit_reservation(&self.id, &req).await {
+            Ok(resp) => Ok(resp),
+            Err(e) if e.is_retryable() => {
+                CommitRetryEngine::new(self.client.config())
+                    .retry(&self.client, &self.id, &req, e)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
         self.cancel.cancel();
-        self.client.commit_reservation(&self.id, &req).await
+        result
     }
 
     /// Release the reservation, returning reserved budget.

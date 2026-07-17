@@ -223,6 +223,28 @@ let config = CyclesConfig::from_env().expect("missing env vars");
 let client = CyclesClient::new(config);
 ```
 
+### Commit retry
+
+If the attempt inside `guard.commit(...)` fails with a retryable error — a
+transport failure, a 5xx server error, or an error code the protocol
+classifies as transient (e.g. `LIMIT_EXCEEDED` rate limiting; unrecognized
+error codes are treated as transient for forward compatibility, see
+`Error::is_retryable`) — and `retry_enabled` is set (the default), the commit
+is retried **inline** with exponential backoff (`retry_initial_delay` ×
+`retry_multiplier`, capped at `retry_max_delay`, up to `retry_max_attempts`
+attempts). Retries reuse the original request — same idempotency key — so a
+commit that already landed server-side cannot double-charge, and the
+reservation heartbeat keeps extending the TTL until the outcome is final, so
+the reservation cannot expire mid-retry.
+
+The result of `commit()` is final: `Ok` means the spend was recorded, `Err`
+means no further commit attempt will ever be made — safe to compensate.
+Under a persistent outage the call blocks for the full backoff schedule;
+tune the knobs or set `retry_enabled(false)` for fail-fast single-attempt
+commits. Env knobs: `CYCLES_RETRY_ENABLED`, `CYCLES_RETRY_MAX_ATTEMPTS`,
+`CYCLES_RETRY_INITIAL_DELAY`, `CYCLES_RETRY_MULTIPLIER`,
+`CYCLES_RETRY_MAX_DELAY`.
+
 ## Features
 
 | Feature | Default | Description |
