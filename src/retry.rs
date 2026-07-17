@@ -1,14 +1,24 @@
-//! Background commit retry engine with exponential backoff.
+//! Inline commit retry with exponential backoff.
 
 use std::time::Duration;
 
 use crate::client::CyclesClient;
 use crate::config::CyclesConfig;
+use crate::error::Error;
+use crate::models::response::CommitResponse;
 use crate::models::{CommitRequest, ReservationId};
 
-/// Retries failed commit operations in the background with exponential backoff.
+/// Retries failed commit operations with exponential backoff.
+///
+/// Wired into [`ReservationGuard::commit`](crate::guard::ReservationGuard::commit):
+/// when the initial commit attempt fails with a retryable error, the guard
+/// awaits [`retry`](Self::retry) inline until the commit succeeds, fails with
+/// a non-retryable error, or attempts are exhausted. Retries reuse the
+/// original [`CommitRequest`] — same idempotency key — so a commit that landed
+/// server-side but failed on the response path cannot double-charge. Running
+/// inline (not in a detached task) keeps `commit()`'s contract exact: once it
+/// returns `Err`, no further commit attempt will ever be made.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Wired into guard commit-failure path in a future release
 pub(crate) struct CommitRetryEngine {
     enabled: bool,
     max_attempts: u32,
@@ -17,7 +27,6 @@ pub(crate) struct CommitRetryEngine {
     max_delay: Duration,
 }
 
-#[allow(dead_code)]
 impl CommitRetryEngine {
     /// Create a new retry engine from client configuration.
     pub fn new(config: &CyclesConfig) -> Self {
@@ -30,40 +39,46 @@ impl CommitRetryEngine {
         }
     }
 
-    /// Schedule a fire-and-forget background retry for a failed commit.
-    pub fn schedule(
+    /// Retry a failed commit until success, a non-retryable error, or attempt
+    /// exhaustion, and return the final outcome.
+    ///
+    /// `first_error` is the error from the initial attempt; it is returned
+    /// unchanged when retry is disabled. On exhaustion the most recent error
+    /// is returned.
+    pub async fn retry(
         &self,
-        client: CyclesClient,
-        reservation_id: ReservationId,
-        commit_request: CommitRequest,
-    ) {
+        client: &CyclesClient,
+        reservation_id: &ReservationId,
+        commit_request: &CommitRequest,
+        first_error: Error,
+    ) -> Result<CommitResponse, Error> {
         if !self.enabled {
-            return;
+            return Err(first_error);
         }
 
-        let engine = self.clone();
-        tokio::spawn(async move {
-            engine
-                .retry_loop(client, reservation_id, commit_request)
-                .await;
-        });
-    }
+        tracing::debug!(
+            reservation_id = %reservation_id,
+            max_attempts = self.max_attempts,
+            error = %first_error,
+            "commit failed with retryable error; retrying with backoff"
+        );
 
-    async fn retry_loop(
-        &self,
-        client: CyclesClient,
-        reservation_id: ReservationId,
-        commit_request: CommitRequest,
-    ) {
+        let mut last_error = first_error;
         for attempt in 0..self.max_attempts {
-            let backoff = self.backoff_delay(attempt);
-            tokio::time::sleep(backoff).await;
+            tokio::time::sleep(self.backoff_delay(attempt)).await;
 
             match client
-                .commit_reservation(&reservation_id, &commit_request)
+                .commit_reservation(reservation_id, commit_request)
                 .await
             {
-                Ok(_) => return,
+                Ok(resp) => {
+                    tracing::debug!(
+                        reservation_id = %reservation_id,
+                        attempt = attempt + 1,
+                        "commit retry succeeded"
+                    );
+                    return Ok(resp);
+                }
                 Err(e) if !e.is_retryable() => {
                     tracing::warn!(
                         reservation_id = %reservation_id,
@@ -71,7 +86,7 @@ impl CommitRetryEngine {
                         error = %e,
                         "commit retry hit non-retryable error, stopping"
                     );
-                    return;
+                    return Err(e);
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -80,6 +95,7 @@ impl CommitRetryEngine {
                         error = %e,
                         "commit retry attempt failed, will retry"
                     );
+                    last_error = e;
                 }
             }
         }
@@ -89,6 +105,7 @@ impl CommitRetryEngine {
             attempts = self.max_attempts,
             "commit retry exhausted"
         );
+        Err(last_error)
     }
 
     fn backoff_delay(&self, attempt: u32) -> Duration {
@@ -101,6 +118,7 @@ impl CommitRetryEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ErrorCode;
 
     fn test_config() -> CyclesConfig {
         CyclesConfig {
@@ -116,10 +134,27 @@ mod tests {
             read_timeout: Duration::from_secs(5),
             retry_enabled: true,
             retry_max_attempts: 3,
-            retry_initial_delay: Duration::from_millis(100),
+            retry_initial_delay: Duration::from_millis(1),
             retry_multiplier: 2.0,
             retry_max_delay: Duration::from_secs(5),
         }
+    }
+
+    fn transient_error() -> Error {
+        Error::Api {
+            status: 500,
+            code: Some(ErrorCode::InternalError),
+            message: "boom".into(),
+            request_id: None,
+            retry_after: None,
+            details: None,
+        }
+    }
+
+    fn commit_request() -> CommitRequest {
+        CommitRequest::builder()
+            .actual(crate::models::Amount::usd_microcents(100))
+            .build()
     }
 
     #[test]
@@ -128,14 +163,16 @@ mod tests {
         let engine = CommitRetryEngine::new(&config);
         assert!(engine.enabled);
         assert_eq!(engine.max_attempts, 3);
-        assert_eq!(engine.initial_delay, Duration::from_millis(100));
+        assert_eq!(engine.initial_delay, Duration::from_millis(1));
         assert_eq!(engine.multiplier, 2.0);
         assert_eq!(engine.max_delay, Duration::from_secs(5));
     }
 
     #[test]
     fn backoff_delay_exponential() {
-        let engine = CommitRetryEngine::new(&test_config());
+        let mut config = test_config();
+        config.retry_initial_delay = Duration::from_millis(100);
+        let engine = CommitRetryEngine::new(&config);
         // initial=100ms, multiplier=2.0
         assert_eq!(engine.backoff_delay(0), Duration::from_millis(100));
         assert_eq!(engine.backoff_delay(1), Duration::from_millis(200));
@@ -146,6 +183,7 @@ mod tests {
     #[test]
     fn backoff_delay_capped() {
         let mut config = test_config();
+        config.retry_initial_delay = Duration::from_millis(100);
         config.retry_max_delay = Duration::from_millis(300);
         let engine = CommitRetryEngine::new(&config);
 
@@ -156,25 +194,34 @@ mod tests {
         assert_eq!(engine.backoff_delay(10), Duration::from_millis(300));
     }
 
-    #[test]
-    fn disabled_schedule_is_noop() {
+    #[tokio::test]
+    async fn disabled_returns_first_error_without_attempting() {
         let mut config = test_config();
         config.retry_enabled = false;
         let engine = CommitRetryEngine::new(&config);
-        assert!(!engine.enabled);
 
-        // schedule should not panic even with a client pointing nowhere
+        // Client points at a closed port: any network attempt would fail
+        // with a transport error, not the Api error we pass in.
         let client = CyclesClient::builder("key", "http://127.0.0.1:1").build();
-        let id = ReservationId::new("rsv_noop");
-        let req = CommitRequest::builder()
-            .actual(crate::models::Amount::usd_microcents(100))
-            .build();
-        engine.schedule(client, id, req);
-        // No panic = success
+        let id = ReservationId::new("rsv_off");
+
+        let err = engine
+            .retry(&client, &id, &commit_request(), transient_error())
+            .await
+            .unwrap_err();
+        match err {
+            Error::Api {
+                status, message, ..
+            } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected the original Api error back, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn retry_loop_succeeds_on_first_attempt() {
+    async fn retry_succeeds_and_returns_response() {
         use serde_json::json;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -194,15 +241,15 @@ mod tests {
 
         let engine = CommitRetryEngine::new(&test_config());
         let id = ReservationId::new("rsv_ok");
-        let req = CommitRequest::builder()
-            .actual(crate::models::Amount::usd_microcents(100))
-            .build();
-
-        engine.retry_loop(client, id, req).await;
+        let resp = engine
+            .retry(&client, &id, &commit_request(), transient_error())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, crate::models::CommitStatus::Committed);
     }
 
     #[tokio::test]
-    async fn retry_loop_stops_on_non_retryable() {
+    async fn retry_stops_on_non_retryable_and_returns_it() {
         use serde_json::json;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -221,19 +268,17 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut config = test_config();
-        config.retry_initial_delay = Duration::from_millis(1);
-        let engine = CommitRetryEngine::new(&config);
+        let engine = CommitRetryEngine::new(&test_config());
         let id = ReservationId::new("rsv_nr");
-        let req = CommitRequest::builder()
-            .actual(crate::models::Amount::usd_microcents(100))
-            .build();
-
-        engine.retry_loop(client, id, req).await;
+        let err = engine
+            .retry(&client, &id, &commit_request(), transient_error())
+            .await
+            .unwrap_err();
+        assert!(!err.is_retryable());
     }
 
     #[tokio::test]
-    async fn retry_loop_exhausts_attempts() {
+    async fn retry_exhausts_attempts_and_returns_last_error() {
         use serde_json::json;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -254,13 +299,14 @@ mod tests {
 
         let mut config = test_config();
         config.retry_max_attempts = 2;
-        config.retry_initial_delay = Duration::from_millis(1);
         let engine = CommitRetryEngine::new(&config);
         let id = ReservationId::new("rsv_ex");
-        let req = CommitRequest::builder()
-            .actual(crate::models::Amount::usd_microcents(100))
-            .build();
-
-        engine.retry_loop(client, id, req).await;
+        let err = engine
+            .retry(&client, &id, &commit_request(), transient_error())
+            .await
+            .unwrap_err();
+        // The last server error, not the seed error, is surfaced.
+        assert!(err.is_retryable());
+        assert_eq!(err.request_id(), Some("req-2"));
     }
 }

@@ -196,6 +196,24 @@ impl CyclesClientBuilder {
         self
     }
 
+    /// Set the initial delay before the first commit retry.
+    pub fn retry_initial_delay(mut self, delay: Duration) -> Self {
+        self.config.retry_initial_delay = delay;
+        self
+    }
+
+    /// Set the exponential backoff multiplier for commit retries.
+    pub fn retry_multiplier(mut self, multiplier: f64) -> Self {
+        self.config.retry_multiplier = multiplier;
+        self
+    }
+
+    /// Set the maximum delay between commit retries.
+    pub fn retry_max_delay(mut self, delay: Duration) -> Self {
+        self.config.retry_max_delay = delay;
+        self
+    }
+
     /// Provide a pre-configured `reqwest::Client` for connection pool sharing.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);

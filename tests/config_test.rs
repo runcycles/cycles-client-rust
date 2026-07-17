@@ -30,6 +30,9 @@ fn builder_sets_all_fields() {
         .read_timeout(Duration::from_secs(3))
         .retry_enabled(false)
         .retry_max_attempts(3)
+        .retry_initial_delay(Duration::from_millis(250))
+        .retry_multiplier(1.5)
+        .retry_max_delay(Duration::from_secs(10))
         .build();
 
     let config = client.config();
@@ -43,6 +46,9 @@ fn builder_sets_all_fields() {
     assert_eq!(config.read_timeout, Duration::from_secs(3));
     assert!(!config.retry_enabled);
     assert_eq!(config.retry_max_attempts, 3);
+    assert_eq!(config.retry_initial_delay, Duration::from_millis(250));
+    assert_eq!(config.retry_multiplier, 1.5);
+    assert_eq!(config.retry_max_delay, Duration::from_secs(10));
 }
 
 #[test]
