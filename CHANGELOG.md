@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+Commit-retry wiring fix, plus `TENANT_CLOSED` + `LIMIT_EXCEEDED` error-code support.
+
+### Fixed
+
+- **Commit retry engine wired into `guard.commit()`** ([#62](https://github.com/runcycles/cycles-client-rust/pull/62)). `CommitRetryEngine` existed since 0.2.0 with complete backoff logic but was `#[allow(dead_code)]` and never invoked, so the documented `retry_*` config knobs (builder methods, `CYCLES_RETRY_*` env vars) were silent no-ops and a transient commit failure permanently leaked the reservation until server-side TTL expiry, never recording the actual spend. `guard.commit()` now retries retryable failures (transport errors, 5xx, and error codes the protocol classifies transient per `Error::is_retryable`) **inline** with exponential backoff:
+  - the heartbeat keeps extending the reservation TTL until the commit outcome is final, so retries cannot lose the reservation to expiry;
+  - the returned `Ok`/`Err` is definitive — no commit activity survives the call, so callers may safely compensate on `Err`;
+  - no detached background task exists, so nothing is silently lost on runtime shutdown;
+  - retries reuse the original `CommitRequest` (same idempotency key), so a commit that already landed server-side cannot double-charge.
+
+  Under a persistent outage `commit()` blocks for the full backoff schedule; tune the `retry_*` knobs or set `retry_enabled(false)` for fail-fast single-attempt commits.
+- `Cargo.lock`: `quinn-proto` 0.11.14 → 0.11.16 for [RUSTSEC-2026-0185](https://rustsec.org/advisories/RUSTSEC-2026-0185) (remote memory exhaustion via unbounded out-of-order stream reassembly) and `anyhow` 1.0.102 → 1.0.103 for [RUSTSEC-2026-0190](https://rustsec.org/advisories/RUSTSEC-2026-0190) (unsoundness in `Error::downcast_mut()`); both transitive dependencies, flagged by the `cargo audit --deny warnings` CI gate.
+
 `TENANT_CLOSED` + `LIMIT_EXCEEDED` error-code support. `TENANT_CLOSED` implements the runtime spec v0.1.25.13 revision of `cycles-protocol-v0.yaml` ([runcycles/cycles-protocol#125](https://github.com/runcycles/cycles-protocol/pull/125)): servers return HTTP 409 `error=TENANT_CLOSED` on reservation create/commit/release/extend when the owning tenant is CLOSED (mirrors governance spec Rule 2). `LIMIT_EXCEEDED` closes the same class of gap for the runtime spec v0.1.25.12 revision (2026-07-04): HTTP 429 rate-limit responses (public evidence/JWKS endpoints) carry `error=LIMIT_EXCEEDED` plus `Retry-After` / `X-RateLimit-Reset` headers.
 
 ### Added
@@ -13,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - `ErrorCode::TenantClosed` variant (serde string mapping `"TENANT_CLOSED"`). `ErrorCode` is `#[non_exhaustive]` with a `#[serde(other)] Unknown` arm, so this is source- and wire-compatible.
 - `Error::is_tenant_closed()` helper, mirroring `Error::is_budget_exceeded()`: matches `Error::Api { code: Some(ErrorCode::TenantClosed), .. }`.
 - Regression tests: serde roundtrip for the new variant (`src/models/enums.rs`), `Error` helper behavior (`tests/error_test.rs`), and a wiremock test pinning that a 409 `TENANT_CLOSED` body surfaces as `Error::Api` with the typed code — not the `BudgetExceeded` convenience variant — and is non-retryable (`tests/client_test.rs`).
+- `CyclesClientBuilder::retry_initial_delay()`, `::retry_multiplier()`, `::retry_max_delay()` — the retry knobs that previously existed only as config fields / env vars now have builder setters ([#62](https://github.com/runcycles/cycles-client-rust/pull/62)).
 - `ErrorCode::LimitExceeded` variant (serde string `"LIMIT_EXCEEDED"`), added in spec declaration order (after `MaxExtensionsExceeded`; `TenantClosed` relocated after it so the enum mirrors the spec exactly). Classified **retryable** by `ErrorCode::is_retryable()` — 429 is transient and the spec instructs retry after the indicated delay; `Error::is_retryable()` picks this up via the code-based arm (the status-based arm only covers ≥500). This preserves the prior `#[serde(other)] Unknown → retryable` fallback behavior, now typed instead of accidental. Enum-only by design, matching the `BudgetFrozen`/`BudgetClosed` pattern: not a reservation-lifecycle denial, so no `Error` helper or 409 classification change. Serde roundtrip + `Error` retryability + wiremock 429 regression tests added.
 
 ### Notes
