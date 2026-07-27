@@ -57,6 +57,25 @@ pub struct CommitResponse {
     /// Current balances after the commit.
     #[serde(default)]
     pub balances: Option<Vec<Balance>>,
+    /// The direct-debit event that recorded the spend, when the reservation
+    /// expired before the commit landed and the client recovered via the
+    /// event fallback (`POST /v1/events`).
+    ///
+    /// **Client-side field** — never populated from a server commit
+    /// response. `Some(event_id)` if and only if
+    /// [`status`](Self::status) is
+    /// [`CommitStatus::RecoveredViaEvent`](super::enums::CommitStatus::RecoveredViaEvent).
+    #[serde(default, skip_deserializing)]
+    pub recovered_via_event: Option<EventId>,
+}
+
+impl CommitResponse {
+    /// Returns `true` if the spend was recorded via the event fallback
+    /// rather than a normal reservation commit (see
+    /// [`recovered_via_event`](Self::recovered_via_event)).
+    pub fn is_recovered_via_event(&self) -> bool {
+        self.recovered_via_event.is_some()
+    }
 }
 
 /// Response from releasing a reservation.

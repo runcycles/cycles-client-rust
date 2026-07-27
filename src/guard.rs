@@ -40,7 +40,9 @@ use tokio_util::sync::CancellationToken;
 use crate::client::CyclesClient;
 use crate::error::Error;
 use crate::heartbeat::start_heartbeat;
-use crate::models::request::{CommitRequest, ReleaseRequest};
+use crate::models::common::{Action, Subject};
+use crate::models::enums::{CommitStatus, ErrorCode};
+use crate::models::request::{CommitRequest, EventCreateRequest, ReleaseRequest};
 use crate::models::response::{CommitResponse, ReleaseResponse};
 use crate::models::{Caps, Decision, ReservationId};
 use crate::retry::CommitRetryEngine;
@@ -63,6 +65,8 @@ pub struct ReservationGuard {
     caps: Option<Caps>,
     expires_at_ms: Option<u64>,
     affected_scopes: Vec<String>,
+    subject: Subject,
+    action: Action,
     finalized: bool,
     cancel: CancellationToken,
     _heartbeat: Option<tokio::task::JoinHandle<()>>,
@@ -70,6 +74,7 @@ pub struct ReservationGuard {
 
 impl ReservationGuard {
     /// Create a new guard (called internally by `CyclesClient::reserve`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         client: CyclesClient,
         id: ReservationId,
@@ -78,6 +83,8 @@ impl ReservationGuard {
         expires_at_ms: Option<u64>,
         affected_scopes: Vec<String>,
         ttl_ms: u64,
+        subject: Subject,
+        action: Action,
     ) -> Self {
         let cancel = CancellationToken::new();
         let heartbeat = start_heartbeat(client.clone(), id.clone(), ttl_ms, cancel.clone());
@@ -89,6 +96,8 @@ impl ReservationGuard {
             caps,
             expires_at_ms,
             affected_scopes,
+            subject,
+            action,
             finalized: false,
             cancel,
             _heartbeat: Some(heartbeat),
@@ -125,6 +134,16 @@ impl ReservationGuard {
         &self.affected_scopes
     }
 
+    /// The subject (who is spending) the reservation was created with.
+    pub fn subject(&self) -> &Subject {
+        &self.subject
+    }
+
+    /// The action (what is being done) the reservation was created with.
+    pub fn action(&self) -> &Action {
+        &self.action
+    }
+
     /// Commit actual spend against the reservation.
     ///
     /// Consumes the guard, preventing double-commit at compile time, and
@@ -147,6 +166,34 @@ impl ReservationGuard {
     /// so the caller may safely compensate. Under a persistent outage this
     /// call blocks for the full backoff schedule; tune the `retry_*` config
     /// knobs or disable retry for fail-fast single-attempt commits.
+    ///
+    /// # Expired-reservation event fallback
+    ///
+    /// A commit records spend that **already happened**, so a
+    /// `RESERVATION_EXPIRED` rejection (the commit landed after the
+    /// reservation's grace period; the server already returned the reserved
+    /// budget to the pool) must not silently drop the spend. When the commit
+    /// path receives `RESERVATION_EXPIRED` — on the first attempt or during
+    /// retry — the guard records the spend as a post-hoc direct-debit event
+    /// (`POST /v1/events`, no reservation needed) instead:
+    ///
+    /// - the event reuses the commit's **idempotency key**, so the recovery
+    ///   is exactly-once even if it races another client;
+    /// - subject and action are taken from the reservation the guard holds;
+    /// - the commit's metadata is carried over, extended with
+    ///   `recovered_reservation_id` (this reservation's ID) and
+    ///   `recovery_reason = "commit_after_reservation_expired"` so the ledger
+    ///   shows exactly why the spend arrived as an event;
+    /// - transient event failures (transport, 5xx) are retried with the same
+    ///   bounded backoff policy as commits.
+    ///
+    /// On fallback success, `commit()` returns `Ok` with
+    /// [`CommitStatus::RecoveredViaEvent`] and
+    /// [`CommitResponse::recovered_via_event`] set to the recorded event's
+    /// ID. On fallback failure, it returns
+    /// [`Error::CommitRecoveryFailed`] carrying **both** the original
+    /// `RESERVATION_EXPIRED` error and the event error — the spend is not
+    /// recorded and the caller must compensate.
     pub async fn commit(mut self, req: CommitRequest) -> Result<CommitResponse, Error> {
         self.finalized = true;
         // The heartbeat is deliberately NOT cancelled yet: it must keep the
@@ -161,8 +208,108 @@ impl ReservationGuard {
             }
             Err(e) => Err(e),
         };
+        // RESERVATION_EXPIRED is non-retryable (the reservation is gone for
+        // good), so it falls through the retry engine unchanged whether it
+        // occurred on the first attempt or mid-retry. Recover it here.
+        let result = match result {
+            Err(e) if e.error_code() == Some(ErrorCode::ReservationExpired) => {
+                self.recover_via_event(&req, e).await
+            }
+            other => other,
+        };
         self.cancel.cancel();
         result
+    }
+
+    /// Record the spend of an expired-reservation commit as a post-hoc
+    /// direct-debit event. See [`commit`](Self::commit) for the contract.
+    async fn recover_via_event(
+        &self,
+        req: &CommitRequest,
+        commit_error: Error,
+    ) -> Result<CommitResponse, Error> {
+        tracing::warn!(
+            reservation_id = %self.id,
+            "commit rejected with RESERVATION_EXPIRED; recovering spend via direct-debit event"
+        );
+
+        // Carry the commit metadata over, marked so the ledger shows why the
+        // spend arrived as an event. Non-object metadata (legal JSON, if
+        // unusual) is preserved under "original_metadata".
+        let mut metadata = match req.metadata.clone() {
+            Some(serde_json::Value::Object(map)) => map,
+            Some(other) => {
+                let mut map = serde_json::Map::new();
+                map.insert("original_metadata".to_string(), other);
+                map
+            }
+            None => serde_json::Map::new(),
+        };
+        metadata.insert(
+            "recovered_reservation_id".to_string(),
+            serde_json::Value::String(self.id.as_str().to_string()),
+        );
+        metadata.insert(
+            "recovery_reason".to_string(),
+            serde_json::Value::String("commit_after_reservation_expired".to_string()),
+        );
+
+        let event_req = EventCreateRequest {
+            // Same key as the commit: the event namespace is separate from
+            // the commit namespace server-side, and reusing the key makes
+            // the recovery itself exactly-once across retries and racing
+            // clients.
+            idempotency_key: req.idempotency_key.clone(),
+            subject: self.subject.clone(),
+            action: self.action.clone(),
+            actual: req.actual.clone(),
+            // No overage policy: the server default ALLOW_IF_AVAILABLE never
+            // rejects, which is what we want — the spend already happened.
+            overage_policy: None,
+            metrics: req.metrics.clone(),
+            client_time_ms: None,
+            metadata: Some(serde_json::Value::Object(metadata)),
+        };
+
+        let event_result = match self.client.create_event(&event_req).await {
+            Ok(resp) => Ok(resp),
+            Err(e) if e.is_retryable() => {
+                CommitRetryEngine::new(self.client.config())
+                    .retry_event(&self.client, &event_req, e)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+
+        match event_result {
+            Ok(event) => {
+                tracing::info!(
+                    reservation_id = %self.id,
+                    event_id = %event.event_id,
+                    "expired commit recovered via direct-debit event"
+                );
+                Ok(CommitResponse {
+                    status: CommitStatus::RecoveredViaEvent,
+                    charged: event.charged.unwrap_or_else(|| req.actual.clone()),
+                    released: None,
+                    balances: event.balances,
+                    recovered_via_event: Some(event.event_id),
+                })
+            }
+            Err(event_error) => {
+                tracing::error!(
+                    reservation_id = %self.id,
+                    commit_error = %commit_error,
+                    event_error = %event_error,
+                    "event fallback failed after RESERVATION_EXPIRED; spend is NOT recorded"
+                );
+                Err(Error::CommitRecoveryFailed {
+                    reservation_id: self.id.as_str().to_string(),
+                    commit_error: Box::new(commit_error),
+                    event_error: Box::new(event_error),
+                })
+            }
+        }
     }
 
     /// Release the reservation, returning reserved budget.

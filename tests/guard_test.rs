@@ -24,6 +24,12 @@ async fn guard_accessors_with_caps() {
     assert_eq!(caps.max_steps_remaining, Some(10));
     assert_eq!(caps.cooldown_ms, Some(1000));
 
+    // The guard retains the reservation's subject and action (used by the
+    // expired-commit event fallback, and exposed for callers).
+    assert_eq!(guard.subject().tenant.as_deref(), Some("acme"));
+    assert_eq!(guard.action().kind, "llm.completion");
+    assert_eq!(guard.action().name, "gpt-4o");
+
     // Release to clean up
     guard.release("test_done").await.unwrap();
 }

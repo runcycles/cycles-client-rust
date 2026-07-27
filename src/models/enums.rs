@@ -90,6 +90,16 @@ pub enum ReservationStatus {
 pub enum CommitStatus {
     /// The reservation was committed successfully.
     Committed,
+    /// The reservation expired before the commit landed, but the spend was
+    /// recorded via the event fallback (`POST /v1/events`).
+    ///
+    /// **Client-side status** — never sent by the server. Set by
+    /// [`ReservationGuard::commit`](crate::guard::ReservationGuard::commit)
+    /// when a `RESERVATION_EXPIRED` commit is recovered as a post-hoc
+    /// direct-debit event; see
+    /// [`CommitResponse::recovered_via_event`](super::response::CommitResponse::recovered_via_event)
+    /// for the recorded event's ID.
+    RecoveredViaEvent,
     /// An unrecognized status from a newer protocol version.
     #[serde(other)]
     Unknown,
@@ -368,6 +378,13 @@ mod tests {
         assert_eq!(json, "\"COMMITTED\"");
         let cs: CommitStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(cs, CommitStatus::Committed);
+
+        // Client-side status set by the expired-commit event fallback;
+        // roundtrips for symmetry even though servers never send it.
+        let json = serde_json::to_string(&CommitStatus::RecoveredViaEvent).unwrap();
+        assert_eq!(json, "\"RECOVERED_VIA_EVENT\"");
+        let cs: CommitStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(cs, CommitStatus::RecoveredViaEvent);
 
         // ReleaseStatus
         let json = serde_json::to_string(&ReleaseStatus::Released).unwrap();

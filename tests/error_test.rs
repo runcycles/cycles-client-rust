@@ -190,3 +190,96 @@ fn tenant_closed_helper_false_for_other_variants() {
     };
     assert!(!budget.is_tenant_closed());
 }
+
+#[test]
+fn commit_recovery_failed_carries_both_errors_and_is_final() {
+    let err = Error::CommitRecoveryFailed {
+        reservation_id: "rsv_1".into(),
+        commit_error: Box::new(Error::Api {
+            status: 409,
+            code: Some(ErrorCode::ReservationExpired),
+            message: "Reservation expired".into(),
+            request_id: Some("req-c".into()),
+            retry_after: None,
+            details: None,
+        }),
+        event_error: Box::new(Error::Api {
+            status: 500,
+            code: Some(ErrorCode::InternalError),
+            message: "Server error".into(),
+            request_id: Some("req-e".into()),
+            retry_after: None,
+            details: None,
+        }),
+    };
+
+    // Final by construction: commit retry and event fallback both ran out.
+    assert!(!err.is_retryable());
+    assert!(err.retry_after().is_none());
+
+    // Display names the reservation and surfaces both underlying errors.
+    let msg = err.to_string();
+    assert!(msg.contains("rsv_1"));
+    assert!(msg.contains("NOT recorded"));
+    assert!(msg.contains("Reservation expired"));
+    assert!(msg.contains("Server error"));
+
+    // The underlying errors stay programmatically reachable.
+    if let Error::CommitRecoveryFailed {
+        commit_error,
+        event_error,
+        ..
+    } = &err
+    {
+        assert_eq!(
+            commit_error.error_code(),
+            Some(ErrorCode::ReservationExpired)
+        );
+        assert_eq!(event_error.error_code(), Some(ErrorCode::InternalError));
+    } else {
+        unreachable!();
+    }
+}
+
+#[test]
+fn auth_errors_are_distinct_and_non_retryable() {
+    for (status, code) in [(401, ErrorCode::Unauthorized), (403, ErrorCode::Forbidden)] {
+        let err = Error::Api {
+            status,
+            code: Some(code),
+            message: "denied".into(),
+            request_id: None,
+            retry_after: None,
+            details: None,
+        };
+        assert!(err.is_auth_error(), "HTTP {status} must be an auth error");
+        assert!(
+            !err.is_retryable(),
+            "auth failures are deterministic; retrying cannot succeed"
+        );
+        // The message identifies the HTTP status so callers can act.
+        assert!(err.to_string().contains(&status.to_string()));
+    }
+
+    // Status alone is enough, even without a parsed code.
+    let no_code = Error::Api {
+        status: 401,
+        code: None,
+        message: "denied".into(),
+        request_id: None,
+        retry_after: None,
+        details: None,
+    };
+    assert!(no_code.is_auth_error());
+
+    let not_auth = Error::Api {
+        status: 500,
+        code: Some(ErrorCode::InternalError),
+        message: "boom".into(),
+        request_id: None,
+        retry_after: None,
+        details: None,
+    };
+    assert!(!not_auth.is_auth_error());
+    assert!(!Error::Validation("bad".into()).is_auth_error());
+}
