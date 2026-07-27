@@ -17,15 +17,16 @@ pub struct ApiResponse<T> {
     pub rate_limit_reset: Option<u64>,
     /// Tenant from the response headers.
     pub cycles_tenant: Option<String>,
-    /// Server clock sample from the HTTP `Date` response header, as Unix
-    /// milliseconds (second resolution). `None` when the header is absent or
-    /// unparseable.
+    /// The HTTP `Date` response header, as Unix milliseconds (second
+    /// resolution). `None` when the header is absent or unparseable.
     ///
-    /// Paired with a server-frame timestamp from the response body (e.g. a
-    /// reservation's `expires_at_ms`), this allows server-frame interval
-    /// arithmetic that is immune to client/server clock skew — used by the
-    /// heartbeat to derive the *effective* TTL when a tenant policy
-    /// (`max_reservation_ttl_ms`) capped the granted TTL below the request.
+    /// Note the RFC 9110 caveats: `Date` is a whole-second, best-effort
+    /// *origination* timestamp that intermediaries may replace, and it is
+    /// generally **not** stamped by the same clock as body timestamps such
+    /// as a reservation's `expires_at_ms` (in cycles-server those come from
+    /// Redis `TIME` while `Date` comes from the HTTP layer). The heartbeat
+    /// therefore uses `expires_at_ms − date_ms` only as a first-beat
+    /// cadence *hint*, never as a correctness input.
     pub date_ms: Option<u64>,
 }
 

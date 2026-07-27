@@ -24,16 +24,17 @@ pub fn make_reserve_request() -> ReservationCreateRequest {
 }
 
 /// HTTP `Date` header paired with the reserve mocks' `expires_at_ms`
-/// (1_700_000_000 s = Tue, 14 Nov 2023 22:13:20 GMT). The client derives the
-/// heartbeat's *effective* TTL from `expires_at_ms - Date`; without a
-/// consistent pair, hyper's real Date header (far past the fixed expiry)
-/// would clamp the effective TTL to the 1000 ms minimum and turn the
-/// heartbeat chatty during unrelated tests.
+/// (1_700_000_000 s = Tue, 14 Nov 2023 22:13:20 GMT). The client derives a
+/// first-beat cadence *hint* from `expires_at_ms - Date`; keeping the pair
+/// consistent (rather than letting hyper stamp its real, far-future Date —
+/// which would make the raw hint saturate to 0 and be ignored) keeps the
+/// scenario deterministic across suites.
 pub const HTTP_DATE: &str = "Tue, 14 Nov 2023 22:13:20 GMT";
 
 /// Mount `POST /v1/reservations` responding `ALLOW` with the given id.
 /// `expires_at_ms - Date` = 60_000 ms — the default requested TTL, so the
-/// effective TTL equals the requested one.
+/// heartbeat's first beat lands at min(60000/2, 30 s) = 30 s: quiet for the
+/// duration of any unrelated test.
 pub async fn mount_reserve_allow(server: &MockServer, reservation_id: &str) {
     Mock::given(method("POST"))
         .and(path("/v1/reservations"))

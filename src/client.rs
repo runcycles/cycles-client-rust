@@ -170,9 +170,12 @@ impl CyclesClient {
         validation::validate_non_negative(req.estimate.amount, "estimate.amount")?;
 
         // The metadata variant surfaces the HTTP `Date` header: paired with
-        // the body's expires_at_ms it recovers the *effective* TTL when a
-        // tenant policy (max_reservation_ttl_ms) silently capped the grant —
-        // the heartbeat must be seeded from the grant, not the request.
+        // the body's expires_at_ms it yields a rough TTL estimate used as
+        // the heartbeat's *first-beat cadence hint* when a tenant policy
+        // (max_reservation_ttl_ms) silently capped the grant. Hint only —
+        // Date is not the same clock as expires_at_ms (RFC 9110 whole-second
+        // best-effort origination timestamp vs. Redis TIME), so correctness
+        // never depends on it; see src/heartbeat.rs module docs.
         let resp = self.create_reservation_with_metadata(&req).await?;
         let date_ms = resp.date_ms;
         let resp = resp.into_inner();
@@ -234,7 +237,8 @@ impl CyclesClient {
             resp.caps.clone(),
             resp.expires_at_ms,
             resp.affected_scopes.clone(),
-            crate::heartbeat::effective_ttl_ms(resp.expires_at_ms, date_ms, req.ttl_ms),
+            req.ttl_ms,
+            crate::heartbeat::date_ttl_hint_ms(resp.expires_at_ms, date_ms),
             req.subject.clone(),
             req.action.clone(),
         ))
