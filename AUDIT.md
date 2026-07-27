@@ -8,6 +8,22 @@
 
 ---
 
+## 2026-07-27 — heartbeat extend-drift fix (v0.3.1)
+
+P1 liveness, fleet-wide (same bug in all four SDKs). The spec's `extend_by_ms`
+is relative to the reservation's *current* `expires_at_ms`, not request time,
+but `src/heartbeat.rs` extended by `ttl_ms` on every `ttl/2` beat — drifting
+the expiry outward `ttl/2` per beat (kill the process and the reserved budget
+stays locked until the drifted expiry, up to ~6×ttl at default
+`max_extensions`) and burning extensions twice as fast as needed. Fixed with
+alternate-beat extension: first beat extends, each successful `ACTIVE` extend
+skips exactly one beat, a failed extend (Err or non-`ACTIVE` status, incl.
+forward-compat `Unknown`) retries next beat; extend amount stays `ttl_ms`; no
+client-vs-server clock comparison (skew-unsafe). Expiry lead now oscillates in
+`[ttl/2, 1.5·ttl]` with no drift. Three wiremock cadence tests
+(`tests/heartbeat_test.rs`). Coverage 95.81%; tests, clippy
+`-D warnings`, fmt green.
+
 ## 2026-07-27 — v0.3.0 self-review hardening
 
 Adversarial review of the fallback PR: bodyless 429s retry by status alone

@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.1] - 2026-07-27
+
+Heartbeat extend-drift fix (P1 liveness, fleet-wide — same bug in all four SDKs).
+
+### Fixed
+
+- **Heartbeat no longer drifts the reservation expiry outward.** The protocol's `extend_by_ms` extends **relative to the reservation's current `expires_at_ms`**, not to request time (`cycles-protocol-v0.yaml`), but the heartbeat sent `ExtendRequest::new(ttl_ms)` on *every* `ttl/2` beat — drifting the expiry outward by `ttl/2` per beat. Consequences: a killed process left the reserved budget locked until the drifted expiry (a zombie window that grew with runtime, capped only by the server's `max_extensions` ≈ 10 → up to ~6×ttl at defaults), and extensions burned twice as fast as needed, so runs longer than ~`max_extensions × ttl/2` exhausted the allowance and lost heartbeat protection mid-flight. The heartbeat now extends on **alternate beats**: the first beat extends (only `ttl/2` of lifetime remains at that point), each *successful* extend skips exactly one beat, and a failed extend — transport/API error **or** an HTTP-success response whose status is not `ACTIVE` (forward-compat `Unknown`) — is retried on the very next beat. The extend amount stays `ttl_ms` and the client clock is never compared against the server's `expires_at_ms` (clock skew would make that unsafe). Net: no drift, the expiry lead oscillates within `[ttl/2, 1.5·ttl]`, and extension consumption is halved. Regression tests (`tests/heartbeat_test.rs`) run a real short-TTL heartbeat against wiremock and pin the cadence across three beats: extend / skip / extend, failure-then-immediate-retry, and non-`ACTIVE`-status-as-failure.
+
 ## [0.3.0] - 2026-07-27
 
 Commit durability: expired-commit event fallback, plus `Retry-After`-aware retry.
