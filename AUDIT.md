@@ -31,10 +31,20 @@ else extend by `ttl_ms`. Any 2xx counts as applied (`expires_at_ms`
 authoritative, warn on odd status — reverses the first cut); transient
 failures reuse the same idempotency key next beat (replay dedupe); permanent
 codes (`RESERVATION_EXPIRED`/`RESERVATION_FINALIZED`/`MAX_EXTENSIONS_EXCEEDED`
-or HTTP 410) stop the heartbeat. Cancellation unchanged. Six wiremock tests
-with dynamic expiry responders + lead-math/classification unit tests
-(`tests/heartbeat_test.rs`, `src/heartbeat.rs`). Coverage 95.70%; tests,
-clippy `-D warnings`, fmt green.
+or HTTP 410) stop the heartbeat. Cancellation unchanged. Spec-review
+follow-up, same day: tenant policy `max_reservation_ttl_ms` silently caps the
+grant (governance default 1 h) with no effective-TTL response field, so
+seeding from the requested TTL beats far too late (24 h capped to 1 h → first
+beat at 12 h) — the heartbeat is now seeded with the **effective TTL**
+`clamp(expires_at_ms − Date, 1000, requested)` recovered from the reserve
+response body + HTTP `Date` header (new `ApiResponse::date_ms`; `httpdate`
+promoted to direct dep; fallback to requested when either sample is absent or
+garbled), driving interval, lead math, threshold, and extend amount alike;
+and the permanent stop set gained `TENANT_CLOSED` and `NOT_FOUND`/HTTP 404.
+Ten wiremock tests with dynamic expiry responders + lead-math, effective-TTL,
+classification, and `Date`-parsing unit tests (`tests/heartbeat_test.rs`,
+`src/heartbeat.rs`, `src/response.rs`). Coverage 95.77%; tests, clippy
+`-D warnings`, fmt green.
 
 ## 2026-07-27 — v0.3.0 self-review hardening
 

@@ -26,6 +26,11 @@
 //! *larger* than the estimate (safe direction: we extend a little early,
 //! never late).
 //!
+//! `ttl` throughout is the **effective** TTL — the server's actual grant at
+//! reserve time, recovered from `expires_at_ms` and the HTTP `Date` header
+//! (see [`effective_ttl_ms`]) — since tenant policy may silently cap the
+//! requested TTL.
+//!
 //! Per beat (every `ttl/2`, no floor):
 //! - `lead >= 1.5·ttl` → skip (extending now would only build drift);
 //! - otherwise extend by `ttl_ms`. Any HTTP-success (2xx) response counts as
@@ -38,8 +43,9 @@
 //!   the next beat, so a lost response cannot double-extend when the retry
 //!   lands (the server replays the original outcome for the same key).
 //! - Permanent failures — `RESERVATION_EXPIRED`, `RESERVATION_FINALIZED`,
-//!   `MAX_EXTENSIONS_EXCEEDED`, or any HTTP 410 — terminate the heartbeat:
-//!   no further extend can ever succeed, so retrying is pure noise.
+//!   `MAX_EXTENSIONS_EXCEEDED`, `TENANT_CLOSED`, `NOT_FOUND`, or any HTTP
+//!   410/404 — terminate the heartbeat: no further extend can ever succeed,
+//!   so retrying is pure noise.
 //!
 //! Beats are scheduled with [`tokio::time::interval_at`], so a slow extend
 //! round-trip does not push subsequent beats later (no per-beat RTT slip);
@@ -71,9 +77,11 @@ fn should_skip(lead_ms: i128, ttl_ms: u64) -> bool {
 }
 
 /// `true` for extend failures that no retry can ever fix: the reservation is
-/// gone (`RESERVATION_EXPIRED` / any HTTP 410), already committed or released
-/// (`RESERVATION_FINALIZED`), or out of extensions
-/// (`MAX_EXTENSIONS_EXCEEDED`).
+/// gone (`RESERVATION_EXPIRED` / any HTTP 410, `NOT_FOUND` / any HTTP 404 —
+/// a 404'd reservation never comes back), already committed or released
+/// (`RESERVATION_FINALIZED`), out of extensions (`MAX_EXTENSIONS_EXCEEDED`),
+/// or the owning tenant is closed (`TENANT_CLOSED` — irreversible without
+/// administrative action, by which time the reservation has long expired).
 fn is_permanent_extend_failure(e: &Error) -> bool {
     matches!(
         e.error_code(),
@@ -81,11 +89,48 @@ fn is_permanent_extend_failure(e: &Error) -> bool {
             ErrorCode::ReservationExpired
                 | ErrorCode::ReservationFinalized
                 | ErrorCode::MaxExtensionsExceeded
+                | ErrorCode::TenantClosed
+                | ErrorCode::NotFound
         )
-    ) || e.status() == Some(410)
+    ) || matches!(e.status(), Some(410 | 404))
+}
+
+/// The reservation's *effective* TTL: what the server actually granted, as
+/// opposed to what was requested.
+///
+/// Tenant policy (`max_reservation_ttl_ms`, governance default 1 hour)
+/// silently CAPS the granted TTL at reserve time, and the create response
+/// carries no effective-TTL field. Seeding the heartbeat from the requested
+/// TTL would then schedule the first beat far too late (a 24 h request capped
+/// to 1 h → first beat at 12 h, 11 h after expiry). Instead the grant is
+/// recovered from two server-frame values: the response body's
+/// `expires_at_ms` and the HTTP `Date` header (`date_ms`) — server-frame
+/// minus server-frame, so client clock skew cannot corrupt it, and the
+/// `Date` header's 1-second resolution is negligible against the spec's
+/// 1000 ms TTL minimum. Clamped to `[1000, requested]`: never above the
+/// request (the difference also absorbs upstream latency), never below the
+/// spec minimum. Falls back to the requested TTL when either sample is
+/// missing.
+pub(crate) fn effective_ttl_ms(
+    expires_at_ms: Option<u64>,
+    date_ms: Option<u64>,
+    requested_ttl_ms: u64,
+) -> u64 {
+    match (expires_at_ms, date_ms) {
+        (Some(expires), Some(date)) => expires
+            .saturating_sub(date)
+            .min(requested_ttl_ms)
+            .max(crate::constants::MIN_TTL_MS),
+        _ => requested_ttl_ms,
+    }
 }
 
 /// Spawn a background task that periodically extends a reservation's TTL.
+///
+/// `ttl_ms` must be the **effective** TTL — what the server actually granted
+/// (see [`effective_ttl_ms`]), not necessarily what was requested. It drives
+/// everything: the beat interval, the lead formula's `ttl` term, the
+/// `1.5 · ttl` skip threshold, and the per-beat extend amount.
 ///
 /// Ticks every `ttl_ms / 2` (no floor — the spec's minimum `ttl_ms` of 1000
 /// yields a 500 ms interval; any floor would guarantee a lapse for TTLs below
@@ -263,6 +308,16 @@ mod tests {
         )));
         // 410 with an unparseable body (no typed code) is still permanent.
         assert!(is_permanent_extend_failure(&api(410, None)));
+        // Tenant closure is irreversible; a 404'd reservation never returns.
+        assert!(is_permanent_extend_failure(&api(
+            409,
+            Some(ErrorCode::TenantClosed)
+        )));
+        assert!(is_permanent_extend_failure(&api(
+            404,
+            Some(ErrorCode::NotFound)
+        )));
+        assert!(is_permanent_extend_failure(&api(404, None)));
         // Transient shapes are not.
         assert!(!is_permanent_extend_failure(&api(
             500,
@@ -270,5 +325,53 @@ mod tests {
         )));
         assert!(!is_permanent_extend_failure(&api(429, None)));
         assert!(!is_permanent_extend_failure(&Error::Validation("x".into())));
+    }
+
+    #[test]
+    fn effective_ttl_recovers_capped_grant() {
+        // Requested 24 h, tenant policy capped the grant to 1 h: the
+        // server-frame pair (expires_at, Date) recovers the real grant.
+        let date = 1_700_000_000_000;
+        assert_eq!(
+            effective_ttl_ms(Some(date + 3_600_000), Some(date), 86_400_000),
+            3_600_000
+        );
+    }
+
+    #[test]
+    fn effective_ttl_never_exceeds_requested() {
+        // Upstream expiry oddities (or a stale Date) must not inflate the
+        // TTL past what was requested.
+        let date = 1_700_000_000_000;
+        assert_eq!(
+            effective_ttl_ms(Some(date + 10_000), Some(date), 5_000),
+            5_000
+        );
+    }
+
+    #[test]
+    fn effective_ttl_clamps_to_spec_minimum() {
+        // A degenerate pair (expiry at or before Date) clamps to the spec's
+        // 1000 ms minimum rather than zero.
+        let date = 1_700_000_000_000;
+        assert_eq!(effective_ttl_ms(Some(date + 200), Some(date), 5_000), 1_000);
+        assert_eq!(
+            effective_ttl_ms(Some(date - 5_000), Some(date), 5_000),
+            1_000
+        );
+    }
+
+    #[test]
+    fn effective_ttl_falls_back_to_requested() {
+        // Missing either server-frame sample → the requested TTL.
+        assert_eq!(
+            effective_ttl_ms(None, Some(1_700_000_000_000), 5_000),
+            5_000
+        );
+        assert_eq!(
+            effective_ttl_ms(Some(1_700_000_005_000), None, 5_000),
+            5_000
+        );
+        assert_eq!(effective_ttl_ms(None, None, 5_000), 5_000);
     }
 }

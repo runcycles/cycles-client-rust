@@ -1596,6 +1596,7 @@ version = "0.3.1"
 dependencies = [
  "async-openai",
  "bon",
+ "httpdate",
  "pretty_assertions",
  "proptest",
  "reqwest 0.12.28",

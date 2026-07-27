@@ -82,17 +82,19 @@ impl ReservationGuard {
         caps: Option<Caps>,
         expires_at_ms: Option<u64>,
         affected_scopes: Vec<String>,
-        ttl_ms: u64,
+        effective_ttl_ms: u64,
         subject: Subject,
         action: Action,
     ) -> Self {
         let cancel = CancellationToken::new();
         // The reserve response's expires_at_ms (server frame) seeds the
-        // heartbeat's lead estimate; see src/heartbeat.rs module docs.
+        // heartbeat's lead estimate, and the TTL is the *effective* grant
+        // (tenant policy may have silently capped the request); see
+        // src/heartbeat.rs module docs.
         let heartbeat = start_heartbeat(
             client.clone(),
             id.clone(),
-            ttl_ms,
+            effective_ttl_ms,
             expires_at_ms,
             cancel.clone(),
         );

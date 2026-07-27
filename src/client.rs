@@ -169,7 +169,13 @@ impl CyclesClient {
         validation::validate_grace_period_ms(req.grace_period_ms)?;
         validation::validate_non_negative(req.estimate.amount, "estimate.amount")?;
 
-        let resp = self.create_reservation(&req).await?;
+        // The metadata variant surfaces the HTTP `Date` header: paired with
+        // the body's expires_at_ms it recovers the *effective* TTL when a
+        // tenant policy (max_reservation_ttl_ms) silently capped the grant —
+        // the heartbeat must be seeded from the grant, not the request.
+        let resp = self.create_reservation_with_metadata(&req).await?;
+        let date_ms = resp.date_ms;
+        let resp = resp.into_inner();
 
         if resp.decision.is_denied() {
             return Err(Error::BudgetExceeded {
@@ -228,7 +234,7 @@ impl CyclesClient {
             resp.caps.clone(),
             resp.expires_at_ms,
             resp.affected_scopes.clone(),
-            req.ttl_ms,
+            crate::heartbeat::effective_ttl_ms(resp.expires_at_ms, date_ms, req.ttl_ms),
             req.subject.clone(),
             req.action.clone(),
         ))

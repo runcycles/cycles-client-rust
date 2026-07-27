@@ -17,6 +17,16 @@ pub struct ApiResponse<T> {
     pub rate_limit_reset: Option<u64>,
     /// Tenant from the response headers.
     pub cycles_tenant: Option<String>,
+    /// Server clock sample from the HTTP `Date` response header, as Unix
+    /// milliseconds (second resolution). `None` when the header is absent or
+    /// unparseable.
+    ///
+    /// Paired with a server-frame timestamp from the response body (e.g. a
+    /// reservation's `expires_at_ms`), this allows server-frame interval
+    /// arithmetic that is immune to client/server clock skew — used by the
+    /// heartbeat to derive the *effective* TTL when a tenant policy
+    /// (`max_reservation_ttl_ms`) capped the granted TTL below the request.
+    pub date_ms: Option<u64>,
 }
 
 impl<T> ApiResponse<T> {
@@ -52,13 +62,48 @@ impl<T> ApiResponse<T> {
             rate_limit_remaining: header_u32("x-ratelimit-remaining"),
             rate_limit_reset: header_u64("x-ratelimit-reset"),
             cycles_tenant: header_str("x-cycles-tenant"),
+            date_ms: headers
+                .get("date")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_http_date_ms),
         }
     }
+}
+
+/// Parse an HTTP-date (RFC 9110 `Date` header value) into Unix milliseconds.
+///
+/// Returns `None` for garbage or pre-epoch dates — callers must treat a
+/// missing sample as "unknown", never as zero.
+pub(crate) fn parse_http_date_ms(value: &str) -> Option<u64> {
+    let time = httpdate::parse_http_date(value).ok()?;
+    let ms = time.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis();
+    u64::try_from(ms).ok()
 }
 
 impl<T> std::ops::Deref for ApiResponse<T> {
     type Target = T;
     fn deref(&self) -> &T {
         &self.data
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_imf_fixdate() {
+        // 1_700_000_000 s = Tue, 14 Nov 2023 22:13:20 GMT.
+        assert_eq!(
+            parse_http_date_ms("Tue, 14 Nov 2023 22:13:20 GMT"),
+            Some(1_700_000_000_000)
+        );
+    }
+
+    #[test]
+    fn garbage_and_empty_dates_are_none() {
+        assert_eq!(parse_http_date_ms("not-a-date"), None);
+        assert_eq!(parse_http_date_ms(""), None);
+        assert_eq!(parse_http_date_ms("Tue, 99 Nov 2023 22:13:20 GMT"), None);
     }
 }
