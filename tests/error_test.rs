@@ -57,13 +57,16 @@ fn budget_exceeded_error() {
         affected_scopes: vec!["tenant:acme".into()],
         retry_after: Some(Duration::from_millis(10000)),
         request_id: Some("req-budget".into()),
+        status: Some(409),
     };
     assert!(err.is_budget_exceeded());
     assert_eq!(err.retry_after(), Some(Duration::from_millis(10000)));
     assert_eq!(err.request_id(), Some("req-budget"));
     assert_eq!(err.error_code(), Some(ErrorCode::BudgetExceeded));
-    // Budget exceeded with retry_after is retryable
-    assert!(err.is_retryable());
+    assert_eq!(err.status(), Some(409));
+    // A 409 BUDGET_EXCEEDED is a budget fact, not a transient fault:
+    // NOT retryable even when the server suggests a retry delay.
+    assert!(!err.is_retryable());
 }
 
 #[test]
@@ -73,8 +76,83 @@ fn budget_exceeded_without_retry_not_retryable() {
         affected_scopes: vec![],
         retry_after: None,
         request_id: None,
+        status: Some(409),
     };
     assert!(!err.is_retryable());
+}
+
+#[test]
+fn budget_exceeded_retryable_only_on_429_with_retry_after() {
+    // Retryability requires BOTH a 429 status AND a retry delay. This
+    // combination is dormant today (the 409-reclassification is the only
+    // path constructing BudgetExceeded from an error response), but the
+    // invariant is pinned so a future construction site cannot silently
+    // widen retry behavior.
+    let retryable = Error::BudgetExceeded {
+        message: "Over budget".into(),
+        affected_scopes: vec![],
+        retry_after: Some(Duration::from_secs(1)),
+        request_id: None,
+        status: Some(429),
+    };
+    assert!(retryable.is_retryable());
+
+    // 429 without a delay: not retryable.
+    let no_delay = Error::BudgetExceeded {
+        message: "Over budget".into(),
+        affected_scopes: vec![],
+        retry_after: None,
+        request_id: None,
+        status: Some(429),
+    };
+    assert!(!no_delay.is_retryable());
+
+    // DENY-decision-derived (no HTTP error status) with a delay: not
+    // retryable — the delay is advisory, the denial is a budget fact.
+    let deny_derived = Error::BudgetExceeded {
+        message: "Over budget".into(),
+        affected_scopes: vec![],
+        retry_after: Some(Duration::from_secs(1)),
+        request_id: None,
+        status: None,
+    };
+    assert!(!deny_derived.is_retryable());
+    assert_eq!(deny_derived.status(), None);
+}
+
+#[test]
+fn api_429_is_retryable_by_status_alone() {
+    // Cross-SDK parity: a 429 whose body was absent or unparseable (no
+    // typed error code) is still retryable — the status is authoritative.
+    let err = Error::Api {
+        status: 429,
+        code: None,
+        message: "HTTP 429".into(),
+        request_id: None,
+        retry_after: Some(Duration::from_secs(2)),
+        details: None,
+    };
+    assert!(err.is_retryable());
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(2)));
+    assert_eq!(err.status(), Some(429));
+
+    // Even an unrelated (non-retryable) parsed code doesn't defeat the
+    // status-based classification.
+    let err = Error::Api {
+        status: 429,
+        code: Some(ErrorCode::InvalidRequest),
+        message: "mislabeled".into(),
+        request_id: None,
+        retry_after: None,
+        details: None,
+    };
+    assert!(err.is_retryable());
+}
+
+#[test]
+fn status_accessor_none_for_non_http_errors() {
+    assert_eq!(Error::Validation("bad".into()).status(), None);
+    assert_eq!(Error::Config("bad".into()).status(), None);
 }
 
 #[test]
@@ -108,6 +186,7 @@ fn error_display() {
         affected_scopes: vec![],
         retry_after: None,
         request_id: None,
+        status: Some(409),
     };
     let display = format!("{err}");
     assert!(display.contains("budget exceeded"));
@@ -187,6 +266,7 @@ fn tenant_closed_helper_false_for_other_variants() {
         affected_scopes: vec![],
         retry_after: None,
         request_id: None,
+        status: Some(409),
     };
     assert!(!budget.is_tenant_closed());
 }

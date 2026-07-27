@@ -180,6 +180,9 @@ impl CyclesClient {
                 affected_scopes: resp.affected_scopes.clone(),
                 retry_after: resp.retry_after_ms.map(Duration::from_millis),
                 request_id: None,
+                // Derived from a DENY decision on an HTTP 200 response, not
+                // from an HTTP error status.
+                status: None,
             });
         }
 
@@ -471,6 +474,7 @@ impl CyclesClient {
                 affected_scopes: vec![],
                 retry_after,
                 request_id,
+                status: Some(status),
             };
         }
 

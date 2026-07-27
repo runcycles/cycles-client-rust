@@ -8,6 +8,17 @@
 
 ---
 
+## 2026-07-27 — v0.3.0 self-review hardening
+
+Adversarial review of the fallback PR: bodyless 429s retry by status alone
+(honoring `Retry-After`, now clamped to 1 hour per fleet decision D2); an
+HTTP 410 with a mangled body still triggers event recovery (new
+`Error::status()`); the heartbeat is cancelled before recovery runs; a
+non-`APPLIED` fallback-event status is recovery *failure*; the wire string
+`"RECOVERED_VIA_EVENT"` deserializes to `Unknown` so a server cannot fabricate
+a recovery; `BudgetExceeded` is retryable only from a real 429 (new `status`
+field). Coverage 95.28%; tests, clippy `-D warnings`, fmt green.
+
 ## 2026-07-27 — expired-commit event fallback + Retry-After (v0.3.0)
 
 A commit records spend that already happened, so `guard.commit()` no longer

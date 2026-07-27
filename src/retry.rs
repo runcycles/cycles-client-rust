@@ -9,6 +9,11 @@ use crate::models::request::EventCreateRequest;
 use crate::models::response::{CommitResponse, EventCreateResponse};
 use crate::models::{CommitRequest, ReservationId};
 
+/// Upper bound on an honored `Retry-After` (fleet decision D2): the server's
+/// advertised delay is respected up to 1 hour; anything larger is clamped so
+/// a misconfigured or hostile header cannot stall a retry loop indefinitely.
+pub(crate) const RETRY_AFTER_CAP: Duration = Duration::from_secs(3600);
+
 /// Retries failed commit operations with exponential backoff.
 ///
 /// Wired into [`ReservationGuard::commit`](crate::guard::ReservationGuard::commit):
@@ -183,13 +188,16 @@ impl CommitRetryEngine {
     /// Base exponential backoff, raised to the server's `Retry-After` when
     /// the previous response carried one (HTTP 429 `LIMIT_EXCEEDED`, runtime
     /// spec v0.1.25.12): the client must wait **at least** the advertised
-    /// delay, even when that exceeds `retry_max_delay`. Each error's
-    /// `Retry-After` is consumed exactly once — it governs only the sleep
-    /// immediately following the response that carried it.
+    /// delay, even when that exceeds `retry_max_delay`. The honored
+    /// `Retry-After` is clamped to [`RETRY_AFTER_CAP`] (1 hour, fleet
+    /// decision D2) so a bogus or hostile header cannot park the caller for
+    /// an unbounded time. Each error's `Retry-After` is consumed exactly
+    /// once — it governs only the sleep immediately following the response
+    /// that carried it.
     fn delay_for(&self, attempt: u32, last_error: &Error) -> Duration {
         let backoff = self.backoff_delay(attempt);
         match last_error.retry_after() {
-            Some(retry_after) => backoff.max(retry_after),
+            Some(retry_after) => backoff.max(retry_after.min(RETRY_AFTER_CAP)),
             None => backoff,
         }
     }
@@ -308,6 +316,20 @@ mod tests {
         let err = rate_limited_error(Duration::from_secs(10));
         // The client must wait at least Retry-After, even past the cap.
         assert_eq!(engine.delay_for(5, &err), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn delay_for_clamps_retry_after_to_one_hour_cap() {
+        // Fleet decision D2: honor Retry-After only up to 1 hour — a bogus
+        // or hostile header (e.g. 86400s) must not park the caller for a day.
+        let engine = CommitRetryEngine::new(&test_config());
+        let err = rate_limited_error(Duration::from_secs(86_400));
+        assert_eq!(engine.delay_for(0, &err), RETRY_AFTER_CAP);
+        assert_eq!(engine.delay_for(0, &err), Duration::from_secs(3600));
+
+        // At exactly the cap, the full advertised delay is honored.
+        let err = rate_limited_error(Duration::from_secs(3600));
+        assert_eq!(engine.delay_for(0, &err), Duration::from_secs(3600));
     }
 
     #[test]

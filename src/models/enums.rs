@@ -84,7 +84,7 @@ pub enum ReservationStatus {
 }
 
 /// Status returned after a successful commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[non_exhaustive]
 pub enum CommitStatus {
@@ -99,10 +99,33 @@ pub enum CommitStatus {
     /// direct-debit event; see
     /// [`CommitResponse::recovered_via_event`](super::response::CommitResponse::recovered_via_event)
     /// for the recorded event's ID.
+    ///
+    /// Because it is client-synthesized only, the wire string
+    /// `"RECOVERED_VIA_EVENT"` deliberately does **not** deserialize into
+    /// this variant (it maps to [`Unknown`](Self::Unknown)): a
+    /// non-conformant server echoing it must not be able to fabricate a
+    /// recovery and violate the `Some`-iff-`RecoveredViaEvent` invariant on
+    /// [`CommitResponse::recovered_via_event`](super::response::CommitResponse::recovered_via_event).
     RecoveredViaEvent,
     /// An unrecognized status from a newer protocol version.
-    #[serde(other)]
     Unknown,
+}
+
+// Manual Deserialize (Serialize stays derived): only `"COMMITTED"` maps to a
+// typed variant. `"RECOVERED_VIA_EVENT"` is client-synthesized only — a
+// server sending it is non-conformant — so it falls through to `Unknown`
+// like any other unrecognized value.
+impl<'de> Deserialize<'de> for CommitStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "COMMITTED" => Self::Committed,
+            _ => Self::Unknown,
+        })
+    }
 }
 
 /// Status returned after a successful release.
@@ -366,6 +389,23 @@ mod tests {
     }
 
     #[test]
+    fn commit_status_recovered_via_event_wire_guard() {
+        // "RECOVERED_VIA_EVENT" is client-synthesized only (documented
+        // "never server-sent"): a non-conformant server echoing it must not
+        // be able to fabricate a recovery, so it deserializes to Unknown.
+        let cs: CommitStatus = serde_json::from_str("\"RECOVERED_VIA_EVENT\"").unwrap();
+        assert_eq!(cs, CommitStatus::Unknown);
+
+        // Unrecognized future values still fall through to Unknown.
+        let cs: CommitStatus = serde_json::from_str("\"PARTIALLY_COMMITTED\"").unwrap();
+        assert_eq!(cs, CommitStatus::Unknown);
+
+        // The one server-sent value still deserializes typed.
+        let cs: CommitStatus = serde_json::from_str("\"COMMITTED\"").unwrap();
+        assert_eq!(cs, CommitStatus::Committed);
+    }
+
+    #[test]
     fn serde_unknown_reservation_status_fallback() {
         let s: ReservationStatus = serde_json::from_str("\"PENDING\"").unwrap();
         assert_eq!(s, ReservationStatus::Unknown);
@@ -379,12 +419,11 @@ mod tests {
         let cs: CommitStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(cs, CommitStatus::Committed);
 
-        // Client-side status set by the expired-commit event fallback;
-        // roundtrips for symmetry even though servers never send it.
+        // Client-side status set by the expired-commit event fallback:
+        // serializes to its wire string, but deliberately does NOT
+        // deserialize back (see commit_status_recovered_via_event_wire_guard).
         let json = serde_json::to_string(&CommitStatus::RecoveredViaEvent).unwrap();
         assert_eq!(json, "\"RECOVERED_VIA_EVENT\"");
-        let cs: CommitStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(cs, CommitStatus::RecoveredViaEvent);
 
         // ReleaseStatus
         let json = serde_json::to_string(&ReleaseStatus::Released).unwrap();

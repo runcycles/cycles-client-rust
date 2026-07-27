@@ -39,6 +39,10 @@ pub enum Error {
         retry_after: Option<Duration>,
         /// Server-assigned request ID.
         request_id: Option<String>,
+        /// HTTP status of the response this error was classified from.
+        /// `None` when the error was derived from a `DENY` decision on an
+        /// HTTP 200 reservation response rather than an error response.
+        status: Option<u16>,
     },
 
     /// A commit hit `RESERVATION_EXPIRED` and the event-fallback recovery
@@ -80,18 +84,28 @@ pub enum Error {
 impl Error {
     /// Returns `true` if the error is retryable.
     ///
-    /// Transport errors and server errors (5xx) are generally retryable.
-    /// Budget exceeded errors are not retryable unless the server suggests a retry delay.
+    /// Transport errors, server errors (5xx), and rate limiting (HTTP 429)
+    /// are retryable. 429 is retryable **by status alone** — even when the
+    /// body is absent or unparseable (no typed error code), the status is
+    /// authoritative and any `Retry-After` header is still honored — matching
+    /// the other Cycles SDKs. Budget exceeded errors are only retryable when
+    /// they came from an actual 429 rate-limit response carrying a retry
+    /// delay; a 409 `BUDGET_EXCEEDED` (or a `DENY` decision) is a budget
+    /// fact, not a transient fault, regardless of any suggested delay.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport(_) => true,
             Self::Api { status, code, .. } => {
-                if *status >= 500 {
+                if *status >= 500 || *status == 429 {
                     return true;
                 }
                 code.is_some_and(|c| c.is_retryable())
             }
-            Self::BudgetExceeded { retry_after, .. } => retry_after.is_some(),
+            Self::BudgetExceeded {
+                retry_after,
+                status,
+                ..
+            } => retry_after.is_some() && *status == Some(429),
             // Final by construction: both the commit path (including its
             // inline retry) and the event fallback (including its own bounded
             // retry) have already run to completion.
@@ -146,6 +160,20 @@ impl Error {
                 ..
             }
         )
+    }
+
+    /// Returns the HTTP status code of the response this error was built
+    /// from, if any.
+    ///
+    /// `None` for errors that did not come from an HTTP error response
+    /// (transport failures, client-side validation, and `BudgetExceeded`
+    /// derived from a `DENY` decision on an HTTP 200 response).
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            Self::Api { status, .. } => Some(*status),
+            Self::BudgetExceeded { status, .. } => *status,
+            _ => None,
+        }
     }
 
     /// Returns the suggested retry delay, if any.

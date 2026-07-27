@@ -385,6 +385,205 @@ async fn commit_429_waits_at_least_retry_after() {
 }
 
 #[tokio::test]
+async fn commit_429_without_parseable_body_is_still_retried_honoring_retry_after() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    mount_reserve_allow(&server, "rsv_429_raw").await;
+    mount_extend(&server, "rsv_429_raw").await;
+
+    // 429 whose body is NOT the JSON error envelope (proxy/LB interposition):
+    // no typed error code can be parsed, but the status alone must classify
+    // the response as retryable and the Retry-After header must be honored.
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations/rsv_429_raw/commit"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "1")
+                .set_body_string("<html>Too Many Requests</html>"),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations/rsv_429_raw/commit"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "COMMITTED",
+            "charged": {"unit": "USD_MICROCENTS", "amount": 5000}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let guard = reserve(&client).await;
+    let started = std::time::Instant::now();
+    let resp = guard
+        .commit(
+            CommitRequest::builder()
+                .actual(Amount::usd_microcents(5000))
+                .build(),
+        )
+        .await
+        .expect("bodyless 429 must be retried by status alone");
+    let elapsed = started.elapsed();
+
+    assert_eq!(resp.status, CommitStatus::Committed);
+    assert!(
+        elapsed >= Duration::from_millis(950),
+        "retry must honor the Retry-After header even without a parseable \
+         body (waited {elapsed:?})"
+    );
+    assert_eq!(calls_to(&server, "/commit").await.len(), 2);
+}
+
+#[tokio::test]
+async fn commit_410_with_mangled_body_still_recovers_via_event() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    mount_reserve_allow(&server, "rsv_410").await;
+    mount_extend(&server, "rsv_410").await;
+
+    // HTTP 410 (Gone) with a non-JSON body: no RESERVATION_EXPIRED code can
+    // be parsed, but the status alone means the reservation is settled —
+    // the event fallback must still fire.
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations/rsv_410/commit"))
+        .respond_with(ResponseTemplate::new(410).set_body_string("gone (not json)"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "APPLIED",
+            "event_id": "evt_410"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let guard = reserve(&client).await;
+    let resp = guard
+        .commit(
+            CommitRequest::builder()
+                .actual(Amount::usd_microcents(4200))
+                .build(),
+        )
+        .await
+        .expect("a mangled 410 body must still trigger event recovery");
+
+    assert_eq!(resp.status, CommitStatus::RecoveredViaEvent);
+    assert_eq!(resp.recovered_via_event, Some(EventId::new("evt_410")));
+}
+
+#[tokio::test]
+async fn event_fallback_rejects_non_applied_status_as_recovery() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    mount_reserve_allow(&server, "rsv_nap").await;
+    mount_extend(&server, "rsv_nap").await;
+    mount_commit_expired(&server, "rsv_nap").await;
+
+    // HTTP 200 whose status is not APPLIED (an unknown future value): NOT
+    // proof the spend was recorded — must be treated as recovery failure.
+    Mock::given(method("POST"))
+        .and(path("/v1/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "PENDING_SETTLEMENT",
+            "event_id": "evt_pending"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let guard = reserve(&client).await;
+    let err = guard
+        .commit(
+            CommitRequest::builder()
+                .actual(Amount::usd_microcents(4200))
+                .build(),
+        )
+        .await
+        .unwrap_err();
+
+    match &err {
+        Error::CommitRecoveryFailed {
+            reservation_id,
+            commit_error,
+            event_error,
+        } => {
+            assert_eq!(reservation_id, "rsv_nap");
+            assert_eq!(
+                commit_error.error_code(),
+                Some(ErrorCode::ReservationExpired)
+            );
+            let event_msg = event_error.to_string();
+            assert!(
+                event_msg.contains("unexpected status"),
+                "event error must convey the unexpected status: {event_msg}"
+            );
+            assert!(event_msg.contains("Unknown"));
+        }
+        other => panic!("expected CommitRecoveryFailed, got {other:?}"),
+    }
+    assert!(!err.is_retryable());
+}
+
+#[tokio::test]
+async fn commit_409_budget_exceeded_with_retry_after_is_not_retried() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+    mount_reserve_allow(&server, "rsv_409be").await;
+    mount_extend(&server, "rsv_409be").await;
+
+    // A 409 BUDGET_EXCEEDED carrying a Retry-After header: the delay is
+    // surfaced to the caller but must NOT make the error retryable — the
+    // denial is a budget fact. expect(1) fails the test if a retry fires.
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations/rsv_409be/commit"))
+        .respond_with(
+            ResponseTemplate::new(409)
+                .insert_header("Retry-After", "5")
+                .set_body_json(json!({
+                    "error": "BUDGET_EXCEEDED",
+                    "message": "Budget exceeded",
+                    "request_id": "req-409be"
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let guard = reserve(&client).await;
+    let err = guard
+        .commit(
+            CommitRequest::builder()
+                .actual(Amount::usd_microcents(9000))
+                .build(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(err.is_budget_exceeded());
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(5)));
+    assert_eq!(err.status(), Some(409));
+    assert!(
+        !err.is_retryable(),
+        "409 BUDGET_EXCEEDED must not be retryable even with Retry-After"
+    );
+    assert_eq!(
+        calls_to(&server, "/commit").await.len(),
+        1,
+        "no retry may fire on a 409 BUDGET_EXCEEDED"
+    );
+    assert!(
+        calls_to(&server, "/events").await.is_empty(),
+        "BUDGET_EXCEEDED must not trigger the event fallback"
+    );
+}
+
+#[tokio::test]
 async fn retry_after_header_is_parsed_into_the_error() {
     let server = MockServer::start().await;
     let client = CyclesClient::builder("key", server.uri())

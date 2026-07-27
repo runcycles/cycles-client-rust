@@ -41,7 +41,7 @@ use crate::client::CyclesClient;
 use crate::error::Error;
 use crate::heartbeat::start_heartbeat;
 use crate::models::common::{Action, Subject};
-use crate::models::enums::{CommitStatus, ErrorCode};
+use crate::models::enums::{CommitStatus, ErrorCode, EventStatus};
 use crate::models::request::{CommitRequest, EventCreateRequest, ReleaseRequest};
 use crate::models::response::{CommitResponse, ReleaseResponse};
 use crate::models::{Caps, Decision, ReservationId};
@@ -173,9 +173,11 @@ impl ReservationGuard {
     /// `RESERVATION_EXPIRED` rejection (the commit landed after the
     /// reservation's grace period; the server already returned the reserved
     /// budget to the pool) must not silently drop the spend. When the commit
-    /// path receives `RESERVATION_EXPIRED` — on the first attempt or during
-    /// retry — the guard records the spend as a post-hoc direct-debit event
-    /// (`POST /v1/events`, no reservation needed) instead:
+    /// path receives `RESERVATION_EXPIRED` — or any HTTP 410 response, even
+    /// one whose body could not be parsed into a typed error code — on the
+    /// first attempt or during retry, the guard records the spend as a
+    /// post-hoc direct-debit event (`POST /v1/events`, no reservation
+    /// needed) instead:
     ///
     /// - the event reuses the commit's **idempotency key**, so the recovery
     ///   is exactly-once even if it races another client;
@@ -194,6 +196,16 @@ impl ReservationGuard {
     /// [`Error::CommitRecoveryFailed`] carrying **both** the original
     /// `RESERVATION_EXPIRED` error and the event error — the spend is not
     /// recorded and the caller must compensate.
+    ///
+    /// # Cancellation
+    ///
+    /// Recovery is **not** cancellation-transparent: if the caller times out
+    /// or drops this future mid-recovery, the outcome is unknown — the
+    /// fallback event may or may not have landed server-side. It is safe to
+    /// re-`POST /v1/events` with the commit's idempotency key to settle the
+    /// question: the server records the event exactly once per key, so a
+    /// re-post either lands the spend or dedupes against the one that
+    /// already did.
     pub async fn commit(mut self, req: CommitRequest) -> Result<CommitResponse, Error> {
         self.finalized = true;
         // The heartbeat is deliberately NOT cancelled yet: it must keep the
@@ -210,9 +222,19 @@ impl ReservationGuard {
         };
         // RESERVATION_EXPIRED is non-retryable (the reservation is gone for
         // good), so it falls through the retry engine unchanged whether it
-        // occurred on the first attempt or mid-retry. Recover it here.
+        // occurred on the first attempt or mid-retry. Recover it here. An
+        // HTTP 410 (Gone) triggers recovery even when the body could not be
+        // parsed into a typed error code: the status alone means the
+        // reservation is settled/expired.
         let result = match result {
-            Err(e) if e.error_code() == Some(ErrorCode::ReservationExpired) => {
+            Err(e)
+                if e.error_code() == Some(ErrorCode::ReservationExpired)
+                    || e.status() == Some(410) =>
+            {
+                // The reservation is expired for good — stop the heartbeat
+                // BEFORE recovery so it doesn't keep sending doomed extend
+                // requests (traffic and log noise) while the fallback runs.
+                self.cancel.cancel();
                 self.recover_via_event(&req, e).await
             }
             other => other,
@@ -280,6 +302,22 @@ impl ReservationGuard {
             }
             Err(e) => Err(e),
         };
+
+        // An HTTP success whose status is not APPLIED (including a future
+        // status deserialized as `Unknown`) is NOT proof the spend was
+        // recorded — refuse to report recovery on semantics this client
+        // does not understand.
+        let event_result = event_result.and_then(|event| {
+            if event.status == EventStatus::Applied {
+                Ok(event)
+            } else {
+                Err(Error::Validation(format!(
+                    "event fallback returned HTTP success with unexpected status {:?} \
+                     (expected APPLIED); refusing to treat it as recovery",
+                    event.status
+                )))
+            }
+        });
 
         match event_result {
             Ok(event) => {

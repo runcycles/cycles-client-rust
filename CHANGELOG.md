@@ -24,11 +24,21 @@ Commit durability: expired-commit event fallback, plus `Retry-After`-aware retry
 
 ### Changed
 
-- **`Retry-After` is parsed and honored.** Error responses now populate `Error::retry_after()` from the `Retry-After` header (delta-seconds form; previously always `None`), and the retry loop waits **at least** the server's advertised delay after an HTTP 429 `LIMIT_EXCEEDED` — even when that exceeds `retry_max_delay`. Each response's `Retry-After` is consumed exactly once (it governs only the sleep immediately following it); plain exponential backoff applies otherwise.
+- **`Retry-After` is parsed and honored.** Error responses now populate `Error::retry_after()` from the `Retry-After` header (delta-seconds form; previously always `None`), and the retry loop waits **at least** the server's advertised delay after an HTTP 429 `LIMIT_EXCEEDED` — even when that exceeds `retry_max_delay`. Each response's `Retry-After` is consumed exactly once (it governs only the sleep immediately following it); plain exponential backoff applies otherwise. The honored `Retry-After` is clamped to **1 hour** (fleet decision D2) so a bogus or hostile header cannot park a retry loop indefinitely.
+
+### Hardening (adversarial self-review)
+
+- **Bodyless 429 is retryable.** `Error::is_retryable()` now treats HTTP 429 as retryable **by status alone** — a 429 whose body is absent or unparseable (no typed `LIMIT_EXCEEDED` code, e.g. proxy/LB interposition) is still retried, honoring the `Retry-After` header. Cross-SDK parity.
+- **HTTP 410 triggers the event fallback.** Recovery fires on `RESERVATION_EXPIRED` **or** any HTTP 410 response — a mangled/non-JSON 410 body still recovers the spend. New `Error::status()` accessor exposes the originating HTTP status.
+- **Heartbeat stops before recovery.** The heartbeat task is cancelled *before* the event fallback runs (the reservation is expired for good; further extends are doomed traffic and log noise).
+- **Non-`APPLIED` event status is not recovery.** An HTTP-success fallback event whose `status` is anything but `APPLIED` (including forward-compat `Unknown`) is treated as recovery failure → `Error::CommitRecoveryFailed`, with the unexpected status conveyed in `event_error`.
+- **`RECOVERED_VIA_EVENT` wire-guarded.** The wire string `"RECOVERED_VIA_EVENT"` deserializes to `CommitStatus::Unknown` (it is client-synthesized only, documented never-server-sent), so a non-conformant server cannot fabricate a recovery and violate the `recovered_via_event` `Some`-iff-status invariant.
+- **`BudgetExceeded` retryability tightened.** Retryable only when the error came from an actual HTTP 429 **and** carries a retry delay; a 409 `BUDGET_EXCEEDED` with a `Retry-After` header (or a `DENY`-decision denial with `retry_after_ms`) is a budget fact and is no longer reported retryable. `Error::BudgetExceeded` gained a `status: Option<u16>` field (`None` for `DENY`-derived).
+- **Cancellation contract documented.** `commit()`'s docs state that recovery is not cancellation-transparent: if the future is dropped mid-recovery the outcome is unknown, and the caller may safely re-`POST /v1/events` with the commit's idempotency key (exactly-once server-side).
 
 ### Notes
 
-- **Source-level breakage:** `Error` is not `#[non_exhaustive]`, so downstream `match`es over all `Error` variants must add a `CommitRecoveryFailed` arm — hence the 0.3.0 minor bump. Everything else is additive (`CommitStatus` and `CommitResponse` are `#[non_exhaustive]`; `ReservationGuard::new` is `pub(crate)`).
+- **Source-level breakage:** `Error` is not `#[non_exhaustive]`, so downstream `match`es over all `Error` variants must add a `CommitRecoveryFailed` arm, and exhaustive constructors/patterns of `Error::BudgetExceeded` must account for the new `status` field — hence the 0.3.0 minor bump. Everything else is additive (`CommitStatus` and `CommitResponse` are `#[non_exhaustive]`; `ReservationGuard::new` is `pub(crate)`).
 - Regression tests: `tests/recovery_test.rs` (expired→event recovery success incl. idempotency-key reuse and metadata markers, recovery-failure surfacing both errors, bounded event retry, `RESERVATION_FINALIZED` non-recovery, 429 `Retry-After` wall-clock honor, header parsing), plus unit tests for the delay policy (`src/retry.rs`), the new error variant/helper (`tests/error_test.rs`), and the `RECOVERED_VIA_EVENT` serde roundtrip (`src/models/enums.rs`).
 
 ## [0.2.7] - 2026-07-17
