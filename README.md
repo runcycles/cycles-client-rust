@@ -232,10 +232,11 @@ error codes are treated as transient for forward compatibility, see
 `Error::is_retryable`) — and `retry_enabled` is set (the default), the commit
 is retried **inline** with exponential backoff (`retry_initial_delay` ×
 `retry_multiplier`, capped at `retry_max_delay`, up to `retry_max_attempts`
-attempts). Retries reuse the original request — same idempotency key — so a
-commit that already landed server-side cannot double-charge, and the
-reservation heartbeat keeps extending the TTL until the outcome is final, so
-the reservation cannot expire mid-retry.
+attempts). On HTTP 429 the retry waits at least the server's `Retry-After`
+delay, even when that exceeds `retry_max_delay`. Retries reuse the original
+request — same idempotency key — so a commit that already landed server-side
+cannot double-charge, and the reservation heartbeat keeps extending the TTL
+until the outcome is final, so the reservation cannot expire mid-retry.
 
 The result of `commit()` is final: `Ok` means the spend was recorded, `Err`
 means no further commit attempt will ever be made — safe to compensate.
@@ -244,6 +245,26 @@ tune the knobs or set `retry_enabled(false)` for fail-fast single-attempt
 commits. Env knobs: `CYCLES_RETRY_ENABLED`, `CYCLES_RETRY_MAX_ATTEMPTS`,
 `CYCLES_RETRY_INITIAL_DELAY`, `CYCLES_RETRY_MULTIPLIER`,
 `CYCLES_RETRY_MAX_DELAY`.
+
+### Expired-commit event fallback
+
+A commit records spend that **already happened**, so a `RESERVATION_EXPIRED`
+rejection (the commit landed after the reservation's grace period; the
+server already returned the reserved budget to the pool) must not silently
+drop the spend. When the commit path receives `RESERVATION_EXPIRED`,
+`guard.commit(...)` records the spend as a post-hoc direct-debit event
+(`POST /v1/events`, no reservation needed) instead, reusing the commit's
+idempotency key (exactly-once) and marking the event's metadata with
+`recovered_reservation_id` and
+`recovery_reason = "commit_after_reservation_expired"`. Transient event
+failures are retried with the same backoff policy.
+
+On fallback success, `commit()` returns `Ok` with
+`CommitStatus::RecoveredViaEvent` and `CommitResponse::recovered_via_event`
+set to the recorded event's ID. If the fallback fails too, `commit()`
+returns `Error::CommitRecoveryFailed` carrying both the original commit
+error and the event error — the spend is not recorded and the caller must
+compensate.
 
 ## Features
 

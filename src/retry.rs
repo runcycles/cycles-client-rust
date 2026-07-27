@@ -5,8 +5,14 @@ use std::time::Duration;
 use crate::client::CyclesClient;
 use crate::config::CyclesConfig;
 use crate::error::Error;
-use crate::models::response::CommitResponse;
+use crate::models::request::EventCreateRequest;
+use crate::models::response::{CommitResponse, EventCreateResponse};
 use crate::models::{CommitRequest, ReservationId};
+
+/// Upper bound on an honored `Retry-After` (fleet decision D2): the server's
+/// advertised delay is respected up to 1 hour; anything larger is clamped so
+/// a misconfigured or hostile header cannot stall a retry loop indefinitely.
+pub(crate) const RETRY_AFTER_CAP: Duration = Duration::from_secs(3600);
 
 /// Retries failed commit operations with exponential backoff.
 ///
@@ -65,7 +71,7 @@ impl CommitRetryEngine {
 
         let mut last_error = first_error;
         for attempt in 0..self.max_attempts {
-            tokio::time::sleep(self.backoff_delay(attempt)).await;
+            tokio::time::sleep(self.delay_for(attempt, &last_error)).await;
 
             match client
                 .commit_reservation(reservation_id, commit_request)
@@ -106,6 +112,94 @@ impl CommitRetryEngine {
             "commit retry exhausted"
         );
         Err(last_error)
+    }
+
+    /// Retry a failed direct-debit event (`POST /v1/events`) with the same
+    /// bounded backoff policy as commits.
+    ///
+    /// Used by the commit-expired event fallback in
+    /// [`ReservationGuard::commit`](crate::guard::ReservationGuard::commit):
+    /// transport failures and 5xx responses on the fallback event are retried
+    /// so a transient network blip doesn't turn a recoverable expired commit
+    /// into unrecorded spend. Retries reuse the original
+    /// [`EventCreateRequest`] — same idempotency key — so an event that
+    /// already landed server-side cannot double-charge.
+    pub async fn retry_event(
+        &self,
+        client: &CyclesClient,
+        event_request: &EventCreateRequest,
+        first_error: Error,
+    ) -> Result<EventCreateResponse, Error> {
+        if !self.enabled {
+            return Err(first_error);
+        }
+
+        tracing::debug!(
+            idempotency_key = %event_request.idempotency_key,
+            max_attempts = self.max_attempts,
+            error = %first_error,
+            "fallback event failed with retryable error; retrying with backoff"
+        );
+
+        let mut last_error = first_error;
+        for attempt in 0..self.max_attempts {
+            tokio::time::sleep(self.delay_for(attempt, &last_error)).await;
+
+            match client.create_event(event_request).await {
+                Ok(resp) => {
+                    tracing::debug!(
+                        idempotency_key = %event_request.idempotency_key,
+                        attempt = attempt + 1,
+                        "fallback event retry succeeded"
+                    );
+                    return Ok(resp);
+                }
+                Err(e) if !e.is_retryable() => {
+                    tracing::warn!(
+                        idempotency_key = %event_request.idempotency_key,
+                        attempt = attempt + 1,
+                        error = %e,
+                        "fallback event retry hit non-retryable error, stopping"
+                    );
+                    return Err(e);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        idempotency_key = %event_request.idempotency_key,
+                        attempt = attempt + 1,
+                        error = %e,
+                        "fallback event retry attempt failed, will retry"
+                    );
+                    last_error = e;
+                }
+            }
+        }
+
+        tracing::warn!(
+            idempotency_key = %event_request.idempotency_key,
+            attempts = self.max_attempts,
+            "fallback event retry exhausted"
+        );
+        Err(last_error)
+    }
+
+    /// Delay before the attempt that follows `last_error`.
+    ///
+    /// Base exponential backoff, raised to the server's `Retry-After` when
+    /// the previous response carried one (HTTP 429 `LIMIT_EXCEEDED`, runtime
+    /// spec v0.1.25.12): the client must wait **at least** the advertised
+    /// delay, even when that exceeds `retry_max_delay`. The honored
+    /// `Retry-After` is clamped to [`RETRY_AFTER_CAP`] (1 hour, fleet
+    /// decision D2) so a bogus or hostile header cannot park the caller for
+    /// an unbounded time. Each error's `Retry-After` is consumed exactly
+    /// once — it governs only the sleep immediately following the response
+    /// that carried it.
+    fn delay_for(&self, attempt: u32, last_error: &Error) -> Duration {
+        let backoff = self.backoff_delay(attempt);
+        match last_error.retry_after() {
+            Some(retry_after) => backoff.max(retry_after.min(RETRY_AFTER_CAP)),
+            None => backoff,
+        }
     }
 
     fn backoff_delay(&self, attempt: u32) -> Duration {
@@ -194,6 +288,70 @@ mod tests {
         assert_eq!(engine.backoff_delay(10), Duration::from_millis(300));
     }
 
+    fn rate_limited_error(retry_after: Duration) -> Error {
+        Error::Api {
+            status: 429,
+            code: Some(ErrorCode::LimitExceeded),
+            message: "rate limited".into(),
+            request_id: None,
+            retry_after: Some(retry_after),
+            details: None,
+        }
+    }
+
+    #[test]
+    fn delay_for_waits_at_least_the_servers_retry_after() {
+        let engine = CommitRetryEngine::new(&test_config());
+        // Retry-After (3s) exceeds even retry_max_delay (5s cap is above,
+        // but backoff at attempt 0 is 1ms) — the server delay wins.
+        let err = rate_limited_error(Duration::from_secs(3));
+        assert_eq!(engine.delay_for(0, &err), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn delay_for_exceeds_max_delay_when_retry_after_demands_it() {
+        let mut config = test_config();
+        config.retry_max_delay = Duration::from_millis(300);
+        let engine = CommitRetryEngine::new(&config);
+        let err = rate_limited_error(Duration::from_secs(10));
+        // The client must wait at least Retry-After, even past the cap.
+        assert_eq!(engine.delay_for(5, &err), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn delay_for_clamps_retry_after_to_one_hour_cap() {
+        // Fleet decision D2: honor Retry-After only up to 1 hour — a bogus
+        // or hostile header (e.g. 86400s) must not park the caller for a day.
+        let engine = CommitRetryEngine::new(&test_config());
+        let err = rate_limited_error(Duration::from_secs(86_400));
+        assert_eq!(engine.delay_for(0, &err), RETRY_AFTER_CAP);
+        assert_eq!(engine.delay_for(0, &err), Duration::from_secs(3600));
+
+        // At exactly the cap, the full advertised delay is honored.
+        let err = rate_limited_error(Duration::from_secs(3600));
+        assert_eq!(engine.delay_for(0, &err), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn delay_for_keeps_backoff_when_it_already_exceeds_retry_after() {
+        let mut config = test_config();
+        config.retry_initial_delay = Duration::from_millis(500);
+        let engine = CommitRetryEngine::new(&config);
+        let err = rate_limited_error(Duration::from_millis(100));
+        assert_eq!(engine.delay_for(0, &err), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn delay_for_uses_plain_backoff_without_retry_after() {
+        let mut config = test_config();
+        config.retry_initial_delay = Duration::from_millis(100);
+        let engine = CommitRetryEngine::new(&config);
+        assert_eq!(
+            engine.delay_for(1, &transient_error()),
+            Duration::from_millis(200)
+        );
+    }
+
     #[tokio::test]
     async fn disabled_returns_first_error_without_attempting() {
         let mut config = test_config();
@@ -275,6 +433,129 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!err.is_retryable());
+    }
+
+    fn event_request() -> EventCreateRequest {
+        EventCreateRequest::builder()
+            .subject(crate::models::Subject {
+                tenant: Some("acme".into()),
+                ..Default::default()
+            })
+            .action(crate::models::Action::new("llm.completion", "gpt-4o"))
+            .actual(crate::models::Amount::usd_microcents(100))
+            .build()
+    }
+
+    #[tokio::test]
+    async fn event_retry_disabled_returns_first_error_without_attempting() {
+        let mut config = test_config();
+        config.retry_enabled = false;
+        let engine = CommitRetryEngine::new(&config);
+
+        // Closed port: any network attempt would surface as Transport,
+        // not the seed Api error we pass in.
+        let client = CyclesClient::builder("key", "http://127.0.0.1:1").build();
+
+        let err = engine
+            .retry_event(&client, &event_request(), transient_error())
+            .await
+            .unwrap_err();
+        match err {
+            Error::Api {
+                status, message, ..
+            } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("expected the original Api error back, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn event_retry_succeeds_and_returns_response() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = CyclesClient::builder("key", server.uri()).build();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "APPLIED",
+                "event_id": "evt_ok"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let engine = CommitRetryEngine::new(&test_config());
+        let resp = engine
+            .retry_event(&client, &event_request(), transient_error())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, crate::models::EventStatus::Applied);
+        assert_eq!(resp.event_id.as_str(), "evt_ok");
+    }
+
+    #[tokio::test]
+    async fn event_retry_stops_on_non_retryable_and_returns_it() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = CyclesClient::builder("key", server.uri()).build();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/events"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "INVALID_REQUEST",
+                "message": "Bad event",
+                "request_id": "req-evt-1"
+            })))
+            .expect(1) // Only called once, not retried
+            .mount(&server)
+            .await;
+
+        let engine = CommitRetryEngine::new(&test_config());
+        let err = engine
+            .retry_event(&client, &event_request(), transient_error())
+            .await
+            .unwrap_err();
+        assert!(!err.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn event_retry_exhausts_attempts_and_returns_last_error() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let client = CyclesClient::builder("key", server.uri()).build();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/events"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": "INTERNAL_ERROR",
+                "message": "Server error",
+                "request_id": "req-evt-2"
+            })))
+            .expect(2) // max_attempts = 2
+            .mount(&server)
+            .await;
+
+        let mut config = test_config();
+        config.retry_max_attempts = 2;
+        let engine = CommitRetryEngine::new(&config);
+        let err = engine
+            .retry_event(&client, &event_request(), transient_error())
+            .await
+            .unwrap_err();
+        assert!(err.is_retryable());
+        assert_eq!(err.request_id(), Some("req-evt-2"));
     }
 
     #[tokio::test]

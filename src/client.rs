@@ -180,6 +180,9 @@ impl CyclesClient {
                 affected_scopes: resp.affected_scopes.clone(),
                 retry_after: resp.retry_after_ms.map(Duration::from_millis),
                 request_id: None,
+                // Derived from a DENY decision on an HTTP 200 response, not
+                // from an HTTP error status.
+                status: None,
             });
         }
 
@@ -226,6 +229,8 @@ impl CyclesClient {
             resp.expires_at_ms,
             resp.affected_scopes.clone(),
             req.ttl_ms,
+            req.subject.clone(),
+            req.action.clone(),
         ))
     }
 
@@ -427,6 +432,15 @@ impl CyclesClient {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        // `Retry-After` in delta-seconds form (runtime spec v0.1.25.12 sends
+        // it on HTTP 429 LIMIT_EXCEEDED). The HTTP-date form is not used by
+        // Cycles servers and is ignored. Seconds → Duration (ms internally).
+        let retry_after = headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+
         let body: Option<ErrorResponse> = resp.json().await.ok();
 
         let message = body
@@ -458,8 +472,9 @@ impl CyclesClient {
             return Error::BudgetExceeded {
                 message,
                 affected_scopes: vec![],
-                retry_after: None,
+                retry_after,
                 request_id,
+                status: Some(status),
             };
         }
 
@@ -468,7 +483,7 @@ impl CyclesClient {
             code: error_code,
             message,
             request_id,
-            retry_after: None,
+            retry_after,
             details,
         }
     }

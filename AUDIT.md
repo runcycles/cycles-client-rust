@@ -8,6 +8,36 @@
 
 ---
 
+## 2026-07-27 — v0.3.0 self-review hardening
+
+Adversarial review of the fallback PR: bodyless 429s retry by status alone
+(honoring `Retry-After`, now clamped to 1 hour per fleet decision D2); an
+HTTP 410 with a mangled body still triggers event recovery (new
+`Error::status()`); the heartbeat is cancelled before recovery runs; a
+non-`APPLIED` fallback-event status is recovery *failure*; the wire string
+`"RECOVERED_VIA_EVENT"` deserializes to `Unknown` so a server cannot fabricate
+a recovery; `BudgetExceeded` is retryable only from a real 429 (new `status`
+field). Coverage 95.28%; tests, clippy `-D warnings`, fmt green.
+
+## 2026-07-27 — expired-commit event fallback + Retry-After (v0.3.0)
+
+A commit records spend that already happened, so `guard.commit()` no longer
+drops it when the reservation expired before the commit landed: the spend is
+recovered as a `POST /v1/events` direct-debit reusing the commit's
+idempotency key (exactly-once across the event namespace), with
+`recovered_reservation_id` / `recovery_reason` metadata markers and no
+overage policy (server default `ALLOW_IF_AVAILABLE`); surfaced as
+`CommitStatus::RecoveredViaEvent` + `CommitResponse::recovered_via_event`
+(additive on `#[non_exhaustive]` types). A failed fallback returns the new
+`Error::CommitRecoveryFailed` carrying both the expired-commit error and the
+event error. `RESERVATION_FINALIZED` intentionally does not trigger recovery.
+Error responses now parse the `Retry-After` header (previously dropped) and
+the retry loop waits at least the server's delay on 429 `LIMIT_EXCEEDED`,
+consumed once per response. Added `Error::is_auth_error()`; 401/403 stay
+truthfully non-retryable. Seven wiremock e2e tests (`tests/recovery_test.rs`)
+plus unit coverage in `src/retry.rs`, `tests/error_test.rs`, and the enum
+serde suite; full test suite, clippy `-D warnings`, and fmt all green.
+
 ## 2026-07-27 — workflow dependency maintenance
 
 Dependabot PRs #71 and #72 update the full-SHA workflow pins for
