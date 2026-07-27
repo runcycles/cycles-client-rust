@@ -24,9 +24,12 @@ pub struct ApiResponse<T> {
     /// *origination* timestamp that intermediaries may replace, and it is
     /// generally **not** stamped by the same clock as body timestamps such
     /// as a reservation's `expires_at_ms` (in cycles-server those come from
-    /// Redis `TIME` while `Date` comes from the HTTP layer). The heartbeat
-    /// therefore uses `expires_at_ms − date_ms` only as a first-beat
-    /// cadence *hint*, never as a correctness input.
+    /// Redis `TIME` while `Date` comes from the HTTP layer). Treat
+    /// cross-source arithmetic like `expires_at_ms − date_ms` as a rough
+    /// estimate at best — the SDK itself derives no behavior from this
+    /// field (the reservation heartbeat schedules its first extend
+    /// immediately rather than estimating the lease; see
+    /// `src/heartbeat.rs`).
     pub date_ms: Option<u64>,
 }
 

@@ -21,7 +21,10 @@ async fn api_response_into_inner() {
                     "affected_scopes": ["tenant:acme"]
                 }))
                 .append_header("x-request-id", "req-inner")
-                .append_header("x-cycles-tenant", "acme"),
+                .append_header("x-cycles-tenant", "acme")
+                // Fixed Date header (1_700_000_000 s) so date_ms is
+                // deterministic; overrides the server's own stamp.
+                .insert_header("date", "Tue, 14 Nov 2023 22:13:20 GMT"),
         )
         .mount(&server)
         .await;
@@ -43,6 +46,9 @@ async fn api_response_into_inner() {
     // Test metadata
     assert_eq!(api_resp.request_id.as_deref(), Some("req-inner"));
     assert_eq!(api_resp.cycles_tenant.as_deref(), Some("acme"));
+    // date_ms is a general response utility (parsed via httpdate); the SDK
+    // derives no scheduling from it since heartbeat v2.3.
+    assert_eq!(api_resp.date_ms, Some(1_700_000_000_000));
 
     // Test into_inner
     let inner = api_resp.into_inner();

@@ -23,17 +23,17 @@ pub fn make_reserve_request() -> ReservationCreateRequest {
         .build()
 }
 
-/// HTTP `Date` header paired with the reserve mocks' `expires_at_ms`
-/// (1_700_000_000 s = Tue, 14 Nov 2023 22:13:20 GMT). The client derives a
-/// first-beat cadence *hint* from `expires_at_ms - Date`; keeping the pair
-/// consistent (rather than letting hyper stamp its real, far-future Date —
-/// which would make the raw hint saturate to 0 and be ignored) keeps the
-/// scenario deterministic across suites.
+/// HTTP `Date` header consistent with the reserve mocks' `expires_at_ms`
+/// (1_700_000_000 s = Tue, 14 Nov 2023 22:13:20 GMT). Since heartbeat v2.3
+/// the client derives no scheduling from `Date` (the first extend is
+/// immediate) — the header is kept purely as realistic response furniture.
 pub const HTTP_DATE: &str = "Tue, 14 Nov 2023 22:13:20 GMT";
 
 /// Mount `POST /v1/reservations` responding `ALLOW` with the given id.
-/// `expires_at_ms - Date` = 60_000 ms — the default requested TTL, so the
-/// heartbeat's first beat lands at min(60000/2, 30 s) = 30 s: quiet for the
+/// The heartbeat's first extend fires immediately (v2.3), so suites using
+/// this must also mount the extend endpoint (`mount_extend`); the mocked
+/// grant equals the default 60 s requested TTL, so after that first beat
+/// the cadence settles at min(60000/2, 30 s) = 30 s — quiet for the
 /// duration of any unrelated test.
 pub async fn mount_reserve_allow(server: &MockServer, reservation_id: &str) {
     Mock::given(method("POST"))

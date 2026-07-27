@@ -1,17 +1,23 @@
 //! Tests for the grant-ledger heartbeat (see `src/heartbeat.rs` module docs).
 //!
-//! v2.2: correctness rests on a conservative lead lower bound
+//! v2.3: the first extend fires **immediately** (no bounded delay can outlive
+//! an arbitrarily small tenant-capped lease, so none is used) and primes the
+//! grant ledger. Correctness rests on a conservative lead lower bound
 //! `lead_min = grants_sum − elapsed` (grants are differences of successive
 //! server-frame `expires_at_ms` values; no cross-clock arithmetic). A beat
 //! skips only when `lead_min ≥ 1.5 · last_grant`; otherwise it extends by
-//! the **requested** TTL. Beat delays are per-beat: the first is
-//! `min(requested/2, 30 s, date_hint/2)` (the `Date`-derived TTL is a
-//! cadence hint only), then `clamp(last_grant/2, 500 ms, requested/2)`.
+//! the **requested** TTL. After a success the cadence is
+//! `clamp(grant/2, 500 ms, requested/2)` — unless the grant looks like a
+//! maximum-LEAD clamp (grant ≈ elapsed instead of ≈ requested), in which
+//! case the cadence is held at `min(requested/2, 30 s)` so the observed
+//! "grants" (which merely measure elapsed time) cannot collapse the cadence
+//! to the floor and burn the extension allowance.
+//!
 //! These tests run a real short-TTL heartbeat against wiremock, with
 //! responders that return `expires_at_ms` sequences the grant ledger reacts
-//! to, and count extend calls per beat. The pure delay/lead computations are
-//! unit-tested in `src/heartbeat.rs` (including the 30 s first-beat cap,
-//! which would be impractical to wait out here).
+//! to, and count extend calls per beat. The pure cadence/regime computations
+//! are unit-tested in `src/heartbeat.rs` (including the 30 s held-cadence
+//! cap, which would be impractical to wait out here).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -22,13 +28,10 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-/// Unix ms of [`HTTP_DATE`] — the server-frame "now" stamped on the reserve
-/// response. Paired with `expires_at_ms = DATE_MS + granted_ttl` so the
-/// client derives exactly the intended first-beat cadence hint. (Without an
-/// explicit pair, hyper's real Date header — years past this fixed expiry —
-/// would saturate the raw hint to 0, which the client ignores.)
-const DATE_MS: u64 = 1_700_000_000_000;
-const HTTP_DATE: &str = "Tue, 14 Nov 2023 22:13:20 GMT";
+/// Arbitrary server-frame epoch for the mocks' `expires_at_ms` values. Only
+/// *differences* between successive values matter to the client (heartbeat
+/// v2.3 does no cross-clock arithmetic at all).
+const BASE_MS: u64 = 1_700_000_000_000;
 /// Margin past a beat: long enough to absorb scheduler and loopback-HTTP
 /// latency, short of the following beat.
 const MARGIN: Duration = Duration::from_millis(450);
@@ -37,9 +40,9 @@ fn extend_path(rsv_id: &str) -> String {
     format!("/v1/reservations/{rsv_id}/extend")
 }
 
-/// The initial expiry a reserve granting `ttl` reports: `DATE_MS + ttl`.
+/// The initial expiry a reserve granting `ttl` reports: `BASE_MS + ttl`.
 fn initial_expiry(granted_ttl_ms: u64) -> u64 {
-    DATE_MS + granted_ttl_ms
+    BASE_MS + granted_ttl_ms
 }
 
 /// Responds to extend calls with `expires_at_ms = base + n·step` for the
@@ -82,21 +85,47 @@ impl Respond for ExpirySequence {
     }
 }
 
+/// Models a maximum-LEAD clamp: every extend re-stamps
+/// `expires_at ≈ "now" + L` instead of adding lease, so successive
+/// `expires_at_ms` differences measure *elapsed time between requests*, not
+/// granted lease. Implemented as `base + elapsed-since-creation` at the
+/// received-at instant (the constant L cancels out of every difference and
+/// is therefore irrelevant to the client's ledger).
+struct LeadClampEcho {
+    base: u64,
+    created: std::time::Instant,
+}
+
+impl LeadClampEcho {
+    fn holding(base: u64) -> Self {
+        Self {
+            base,
+            created: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Respond for LeadClampEcho {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let elapsed = u64::try_from(self.created.elapsed().as_millis()).unwrap_or(u64::MAX);
+        ResponseTemplate::new(200).set_body_json(json!({
+            "status": "ACTIVE",
+            "expires_at_ms": self.base + elapsed
+        }))
+    }
+}
+
 /// Mount the reserve + release mocks. The reserve response reports
-/// `expires_at_ms` and carries `date_header` as its HTTP `Date`.
-async fn mount_reserve(server: &MockServer, rsv_id: &str, expires_at_ms: u64, date_header: &str) {
+/// `expires_at_ms`.
+async fn mount_reserve(server: &MockServer, rsv_id: &str, expires_at_ms: u64) {
     Mock::given(method("POST"))
         .and(path("/v1/reservations"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("date", date_header)
-                .set_body_json(json!({
-                    "decision": "ALLOW",
-                    "reservation_id": rsv_id,
-                    "affected_scopes": ["tenant:acme"],
-                    "expires_at_ms": expires_at_ms
-                })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "decision": "ALLOW",
+            "reservation_id": rsv_id,
+            "affected_scopes": ["tenant:acme"],
+            "expires_at_ms": expires_at_ms
+        })))
         .mount(server)
         .await;
     Mock::given(method("POST"))
@@ -124,20 +153,20 @@ async fn do_reserve(server: &MockServer, requested_ttl_ms: u64) -> runcycles::Re
     client.reserve(req).await.unwrap()
 }
 
-/// Reserve where the server grants exactly what was requested
-/// (date hint == requested TTL, so the first beat lands at requested/2).
+/// Reserve where the server grants exactly what was requested.
 async fn reserve_with_ttl(
     server: &MockServer,
     rsv_id: &str,
     ttl_ms: u64,
 ) -> runcycles::ReservationGuard {
-    mount_reserve(server, rsv_id, initial_expiry(ttl_ms), HTTP_DATE).await;
+    mount_reserve(server, rsv_id, initial_expiry(ttl_ms)).await;
     do_reserve(server, ttl_ms).await
 }
 
 /// Bodies of the extend calls received so far, asserting each carried
-/// `extend_by_ms == requested_ttl_ms` (v2.2 always extends by the request;
-/// the server's clamp shows up in the grant ledger, not the wire amount).
+/// `extend_by_ms == requested_ttl_ms` (the heartbeat always extends by the
+/// request; the server's clamp shows up in the grant ledger, not the wire
+/// amount).
 async fn extend_bodies(
     server: &MockServer,
     rsv_id: &str,
@@ -162,13 +191,15 @@ async fn extend_calls(server: &MockServer, rsv_id: &str, requested_ttl_ms: u64) 
     extend_bodies(server, rsv_id, requested_ttl_ms).await.len()
 }
 
-/// Full-grant steady state: with responses granting exactly the requested
-/// TTL, `lead_min = grants_sum − elapsed` produces extend@1..4 (bounds
-/// −1000, 0, 1000, 2000 against the 1.5·grant = 3000 threshold), skip@5
-/// (bound exactly 3000, inclusive), extend@6 — the v2.2 cadence. Not
-/// every-beat (drift) and not blind-alternate (which lapses under clamps).
+/// Immediate first beat + full-grant steady state. The first extend fires
+/// at once (well before ttl/2 — asserted inside the first margin) and
+/// primes the ledger; with responses granting exactly the requested TTL,
+/// `lead_min = grants_sum − elapsed` then produces extend@2..3 (bounds
+/// 1000, 2000 against the 1.5·grant = 3000 threshold), skip@4 (bound
+/// exactly 3000, inclusive), extend@5 — the v2.3 cadence. Not every-beat
+/// (drift) and not blind-alternate (which lapses under clamps).
 #[tokio::test]
-async fn heartbeat_lead_lower_bound_cadence() {
+async fn heartbeat_first_beat_immediate_then_lead_bound_cadence() {
     let server = MockServer::start().await;
     let rsv_id = "rsv_hb_lead";
     const TTL: u64 = 2_000;
@@ -182,58 +213,54 @@ async fn heartbeat_lead_lower_bound_cadence() {
 
     let guard = reserve_with_ttl(&server, rsv_id, TTL).await;
 
-    tokio::time::sleep(BEAT + MARGIN).await;
+    tokio::time::sleep(MARGIN).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
         1,
-        "beat 1 must extend (no grant sample yet)"
+        "the first extend must fire immediately — well before ttl/2 = 1000 ms \
+         (any bounded delay can outlive a small tenant-capped lease)"
     );
 
     tokio::time::sleep(BEAT).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
         2,
-        "beat 2 must extend (lead_min 0)"
+        "beat 2 at 1000 ms must extend (lead_min 1000 < 3000)"
     );
 
     tokio::time::sleep(BEAT).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
         3,
-        "beat 3 must extend (lead_min 1000 < 3000)"
+        "beat 3 at 2000 ms must extend (lead_min 2000 < 3000)"
+    );
+
+    tokio::time::sleep(BEAT).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, TTL).await,
+        3,
+        "beat 4 at 3000 ms must skip (lead_min 3000 = 1.5·grant, inclusive)"
     );
 
     tokio::time::sleep(BEAT).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
         4,
-        "beat 4 must extend (lead_min 2000 < 3000)"
-    );
-
-    tokio::time::sleep(BEAT).await;
-    assert_eq!(
-        extend_calls(&server, rsv_id, TTL).await,
-        4,
-        "beat 5 must skip (lead_min 3000 = 1.5*grant)"
-    );
-
-    tokio::time::sleep(BEAT).await;
-    assert_eq!(
-        extend_calls(&server, rsv_id, TTL).await,
-        5,
-        "beat 6 must extend again (lead_min back to 2000)"
+        "beat 5 at 4000 ms must extend again (lead_min back to 2000)"
     );
 
     guard.release("test done").await.unwrap();
 }
 
-/// Tenant policy caps the grant below the request (governance
+/// Tenant policy caps the lease below the request (governance
 /// `max_reservation_ttl_ms`) and the create response has no effective-TTL
-/// field. The `Date`-derived hint (2000) pulls the first beat to 1000 ms
-/// (requested/2 would be 4000 ms — after expiry), and from then on the
-/// cadence tracks the *observed* grants: responses grant +2000 per extend,
-/// so beats stay at clamp(2000/2, 500, 4000) = 1000 ms — while the wire
-/// `extend_by_ms` stays the REQUESTED 8000 (extend_bodies asserts this).
+/// field. The immediate first beat discovers the real grant at once — a
+/// `requested/2` first beat would fire at 4000 ms, 2000 ms after the capped
+/// lease expired — and from then on the cadence tracks the *observed*
+/// per-extend grants (+2000 each → 1000 ms beats), while the wire
+/// `extend_by_ms` stays the REQUESTED 8000 (`extend_bodies` asserts this).
+/// The real per-extend grant is ≈ 2× the inter-success elapsed, outside the
+/// lead-clamp band, so the cadence is NOT held at requested/2.
 #[tokio::test]
 async fn heartbeat_capped_grant_derives_cadence_from_observed_grants() {
     let server = MockServer::start().await;
@@ -242,8 +269,8 @@ async fn heartbeat_capped_grant_derives_cadence_from_observed_grants() {
     const GRANTED: u64 = 2_000;
     const BEAT: Duration = Duration::from_millis(1_000);
 
-    // The server grants only 2000 ms: expires_at = Date + 2000.
-    mount_reserve(&server, rsv_id, initial_expiry(GRANTED), HTTP_DATE).await;
+    // The server grants only 2000 ms of lease at reserve and per extend.
+    mount_reserve(&server, rsv_id, initial_expiry(GRANTED)).await;
     Mock::given(method("POST"))
         .and(path(extend_path(rsv_id)))
         .respond_with(ExpirySequence::granting(initial_expiry(GRANTED), GRANTED))
@@ -252,85 +279,49 @@ async fn heartbeat_capped_grant_derives_cadence_from_observed_grants() {
 
     let guard = do_reserve(&server, REQUESTED).await;
 
-    // First beat at hint/2 = 1000 ms (requested/2 would be 4000 ms),
-    // extending by the REQUESTED ttl (extend_bodies asserts the amount).
-    tokio::time::sleep(BEAT + MARGIN).await;
+    tokio::time::sleep(MARGIN).await;
     assert_eq!(
         extend_calls(&server, rsv_id, REQUESTED).await,
         1,
-        "beat 1 must fire at hint/2, not requested/2"
+        "the first beat must be immediate — the only schedule that cannot \
+         outlive the silently-capped 2000 ms lease"
     );
 
-    // Grants of 2000 keep the cadence at 1000 ms and the lead low:
-    // beat 2 (lead_min 0) and beat 3 (lead_min 1000 < 3000) both extend.
+    // Grants of 2000 set the cadence to clamp(2000/2, 500, 4000) = 1000 ms
+    // and keep the lead low: beat 2 (lead_min 1000) and beat 3 (lead_min
+    // 2000, both < 3000) extend.
     tokio::time::sleep(BEAT).await;
     assert_eq!(
         extend_calls(&server, rsv_id, REQUESTED).await,
         2,
-        "beat 2 at 2000 ms must extend (cadence follows the observed grant)"
+        "beat 2 at 1000 ms must extend (cadence follows the observed grant)"
     );
     tokio::time::sleep(BEAT).await;
     assert_eq!(
         extend_calls(&server, rsv_id, REQUESTED).await,
         3,
-        "beat 3 at 3000 ms must extend (lead_min 1000 < 1.5*grant)"
+        "beat 3 at 2000 ms must extend (lead_min 2000 < 1.5·grant)"
     );
 
     guard.release("test done").await.unwrap();
 }
 
-/// A garbage `Date` header means no hint: the first beat falls back to
-/// `min(requested/2, 30 s)` — never to raw `expires_at − garbage`
-/// arithmetic, and never to an immediate beat.
+/// A transient failure (HTTP 503) on the immediate first beat is retried at
+/// the **held cadence** `min(requested/2, 30 s)` — never immediately again
+/// (no hot loop against a down server) — **with the same idempotency key**
+/// (a lost response must not double-extend when the retry lands). After a
+/// success, the next extend uses a fresh key.
 #[tokio::test]
-async fn heartbeat_garbage_date_falls_back_to_requested_cadence() {
-    let server = MockServer::start().await;
-    let rsv_id = "rsv_hb_nodate";
-    const TTL: u64 = 2_000;
-
-    // Unparseable Date; the reported expiry (Date-frame + 500) is unusable
-    // without the clock sample and must NOT shrink the first-beat delay.
-    mount_reserve(&server, rsv_id, DATE_MS + 500, "not-a-date").await;
-    Mock::given(method("POST"))
-        .and(path(extend_path(rsv_id)))
-        .respond_with(ExpirySequence::granting(DATE_MS + 500, TTL))
-        .mount(&server)
-        .await;
-
-    let guard = do_reserve(&server, TTL).await;
-
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    assert_eq!(
-        extend_calls(&server, rsv_id, TTL).await,
-        0,
-        "no hint: first-beat delay is requested/2 = 1000 ms, so no beat at 700 ms"
-    );
-
-    tokio::time::sleep(Duration::from_millis(750)).await;
-    assert_eq!(
-        extend_calls(&server, rsv_id, TTL).await,
-        1,
-        "beat 1 at requested/2 extends by the requested ttl"
-    );
-
-    guard.release("test done").await.unwrap();
-}
-
-/// A transient failure (HTTP 500) is retried on the next beat — at the
-/// current cadence, **with the same idempotency key** (a lost response must
-/// not double-extend when the retry lands). After a success, the next
-/// extend uses a fresh key.
-#[tokio::test]
-async fn heartbeat_retry_reuses_idempotency_key_until_success() {
+async fn heartbeat_first_beat_failure_retries_at_held_cadence_with_same_key() {
     let server = MockServer::start().await;
     let rsv_id = "rsv_hb_key";
     const TTL: u64 = 2_000;
     const BEAT: Duration = Duration::from_millis(1_000);
 
-    // First extend attempt fails...
+    // The immediate first attempt fails...
     Mock::given(method("POST"))
         .and(path(extend_path(rsv_id)))
-        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
             "error": "INTERNAL_ERROR",
             "message": "boom"
         })))
@@ -346,19 +337,25 @@ async fn heartbeat_retry_reuses_idempotency_key_until_success() {
 
     let guard = reserve_with_ttl(&server, rsv_id, TTL).await;
 
-    // Beat 1 attempts and fails (delay stays 1000 ms); beat 2 retries with
-    // the same key and succeeds (grant 2000); beat 3 extends with a fresh
-    // key (lead_min 2000 − 3000 < 0).
-    tokio::time::sleep(BEAT + MARGIN).await;
+    // Beat 1 fires immediately and fails; the retry is scheduled at the
+    // held cadence min(2000/2, 30 s) = 1000 ms — exactly ONE attempt must
+    // exist inside the first margin (a zero-delay retry loop would show
+    // dozens).
+    tokio::time::sleep(MARGIN).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
         1,
-        "beat 1 attempts"
+        "the failed immediate beat must wait the held cadence before \
+         retrying — never retry at zero delay"
     );
 
     tokio::time::sleep(BEAT).await;
     let bodies = extend_bodies(&server, rsv_id, TTL).await;
-    assert_eq!(bodies.len(), 2, "beat 2 must retry the failed extend");
+    assert_eq!(
+        bodies.len(),
+        2,
+        "beat 2 at 1000 ms must retry the failed extend"
+    );
     assert_eq!(
         bodies[0]["idempotency_key"], bodies[1]["idempotency_key"],
         "the retry must reuse the failed attempt's idempotency key \
@@ -367,7 +364,7 @@ async fn heartbeat_retry_reuses_idempotency_key_until_success() {
 
     tokio::time::sleep(BEAT).await;
     let bodies = extend_bodies(&server, rsv_id, TTL).await;
-    assert_eq!(bodies.len(), 3, "beat 3 must extend (lead_min negative)");
+    assert_eq!(bodies.len(), 3, "beat 3 must extend (lead_min 0 < 3000)");
     assert_ne!(
         bodies[2]["idempotency_key"], bodies[0]["idempotency_key"],
         "after a success the next extend must use a fresh idempotency key"
@@ -377,12 +374,11 @@ async fn heartbeat_retry_reuses_idempotency_key_until_success() {
 }
 
 /// Scaffold for the permanent-failure tests: every extend gets `status` +
-/// `error_code`; the heartbeat must attempt exactly once and then stop —
-/// no further requests on later beats.
+/// `error_code`; the heartbeat must attempt exactly once (immediately) and
+/// then stop — no further requests on later beats.
 async fn assert_permanent_stop(rsv_id: &str, status: u16, error_code: &str) {
     let server = MockServer::start().await;
     const TTL: u64 = 2_000;
-    const BEAT: Duration = Duration::from_millis(1_000);
 
     Mock::given(method("POST"))
         .and(path(extend_path(rsv_id)))
@@ -395,14 +391,15 @@ async fn assert_permanent_stop(rsv_id: &str, status: u16, error_code: &str) {
 
     let guard = reserve_with_ttl(&server, rsv_id, TTL).await;
 
-    tokio::time::sleep(BEAT + MARGIN).await;
+    tokio::time::sleep(MARGIN).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
         1,
-        "beat 1 attempts and hits the permanent failure ({error_code})"
+        "the immediate beat attempts and hits the permanent failure ({error_code})"
     );
 
-    tokio::time::sleep(BEAT + BEAT).await;
+    // Two full held-cadence periods later: still exactly one attempt.
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
         1,
@@ -433,19 +430,20 @@ async fn heartbeat_stops_on_not_found() {
     assert_permanent_stop("rsv_hb_404", 404, "NOT_FOUND").await;
 }
 
-/// Spec-legal small TTL (1000 < ttl < 2000): with hint == requested == 1200
-/// the first beat lands at 600 ms and full grants keep the cadence at
-/// clamp(1200/2, 500, 600) = 600 ms. Trace: extend@600/1200/1800/2400
-/// (bounds −600, 0, 600, 1200 vs threshold 1800), skip@3000 (bound exactly
-/// 1800). The reservation stays alive the whole way — a fixed 1-second
-/// floor would have guaranteed a lapse here.
+/// Spec-legal small TTL (1000 < ttl < 2000): the first beat is immediate
+/// and full grants of 1200 set the cadence to clamp(600, 500, 600) =
+/// 600 ms. Trace: extend@0/600/1200 (bounds 0, 600, 1200 vs threshold
+/// 1800), skip@1800 (bound exactly 1800), extend@2400. The reservation
+/// stays alive the whole way — a fixed 1-second floor would have
+/// guaranteed a lapse here.
 #[tokio::test]
 async fn heartbeat_small_ttl_stays_alive() {
     let server = MockServer::start().await;
     let rsv_id = "rsv_hb_small";
     const TTL: u64 = 1_200;
-    // Beat length is 600 ms; the sleeps below are cumulative absolute
-    // offsets (850 ms, 2700 ms, 3350 ms) chosen to land mid-gap.
+    // Beat length is 600 ms; the sleeps below land 250 ms past each beat.
+    const SMALL_MARGIN: Duration = Duration::from_millis(250);
+    const SMALL_BEAT: Duration = Duration::from_millis(600);
 
     Mock::given(method("POST"))
         .and(path(extend_path(rsv_id)))
@@ -455,44 +453,55 @@ async fn heartbeat_small_ttl_stays_alive() {
 
     let guard = reserve_with_ttl(&server, rsv_id, TTL).await;
 
-    // 850 ms in: the 600 ms first beat has fired. Under a 1-second floor no
-    // request would exist yet — and the reservation would already be past
-    // half-life with nothing scheduled before expiry.
-    tokio::time::sleep(Duration::from_millis(850)).await;
-    assert!(
-        extend_calls(&server, rsv_id, TTL).await >= 1,
-        "first beat must land at ttl/2 = 600 ms, no 1-second floor"
+    tokio::time::sleep(SMALL_MARGIN).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, TTL).await,
+        1,
+        "the first beat must be immediate"
     );
 
-    // Through beat 4 (2400 ms) + margin: all four beats extend.
-    tokio::time::sleep(Duration::from_millis(1_850)).await;
+    tokio::time::sleep(SMALL_BEAT).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, TTL).await,
+        2,
+        "beat 2 at 600 ms must extend (no 1-second floor; lead_min 600 < 1800)"
+    );
+
+    tokio::time::sleep(SMALL_BEAT).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, TTL).await,
+        3,
+        "beat 3 at 1200 ms must extend (lead_min 1200 < 1800)"
+    );
+
+    tokio::time::sleep(SMALL_BEAT).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, TTL).await,
+        3,
+        "beat 4 at 1800 ms skips once the lead lower bound reaches 1.5·grant"
+    );
+
+    tokio::time::sleep(SMALL_BEAT).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
         4,
-        "beats at 600/1200/1800/2400 ms all extend (lead_min below 1.5*grant)"
-    );
-
-    // Beat 5 (3000 ms): lead_min = 4800 − 3000 = 1800 = 1.5·grant → skip.
-    tokio::time::sleep(Duration::from_millis(650)).await;
-    assert_eq!(
-        extend_calls(&server, rsv_id, TTL).await,
-        4,
-        "beat 5 skips once the lead lower bound reaches 1.5*grant"
+        "beat 5 at 2400 ms must extend again"
     );
 
     guard.release("test done").await.unwrap();
 }
 
-/// A server that clamps grants (extends by only requested/4 per call) keeps
-/// `lead_min` pinned below the skip threshold, so every beat extends — and
-/// the cadence *speeds up* to track the observed grant:
-/// clamp(500/2, 500, 1000) = 500 ms beats after the first. The fixed
-/// alternate-beat cadence would have lapsed the reservation instead.
+/// A server that clamps grants (extends by only requested/4 = 1000 ms per
+/// call) must still TIGHTEN the cadence to grant/2 = 500 ms — a real
+/// per-extend grant is ≈ 2× the inter-success elapsed, outside the
+/// lead-clamp band, so the grant regime applies. Three extends land within
+/// the first 1250 ms (a held requested/2 = 2000 ms cadence would have
+/// produced exactly one), and the reservation never lapses.
 #[tokio::test]
-async fn heartbeat_clamped_grant_extends_every_beat() {
+async fn heartbeat_clamped_grant_still_tightens_cadence() {
     let server = MockServer::start().await;
     let rsv_id = "rsv_hb_clamp";
-    const TTL: u64 = 2_000;
+    const TTL: u64 = 4_000;
 
     Mock::given(method("POST"))
         .and(path(extend_path(rsv_id)))
@@ -502,22 +511,116 @@ async fn heartbeat_clamped_grant_extends_every_beat() {
 
     let guard = reserve_with_ttl(&server, rsv_id, TTL).await;
 
-    // Beat 1 at 1000 ms (grant 500 → 500 ms cadence), then beats at 1500
-    // and 2000 ms: 3 extends by t=2250. lead_min stays at −1000 (each 500
-    // grant is consumed by the 500 ms gap), so no beat ever skips.
-    tokio::time::sleep(Duration::from_millis(2_250)).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
-        3,
-        "clamped grants: beats at 1000/1500/2000 ms all extend"
+        1,
+        "the first beat must be immediate"
     );
 
-    // Beats at 2500 and 3000 ms: still extending every beat.
+    // Grants of 1000 → cadence clamp(500, 500, 2000) = 500 ms: beats at
+    // 500 and 1000 ms both extend (lead_min 500 and 1000, both < 1500).
     tokio::time::sleep(Duration::from_millis(1_000)).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
-        5,
-        "clamped grants keep the lead low: every beat must extend"
+        3,
+        "clamped per-extend grants must tighten the cadence to grant/2 = \
+         500 ms (beats at 0/500/1000 ms) — not hold it at requested/2"
+    );
+
+    guard.release("test done").await.unwrap();
+}
+
+/// A server enforcing a maximum LEAD (every extend re-stamps
+/// `expires_at ≈ now + L`) makes successive `expires_at_ms` differences
+/// measure elapsed time, not lease. Deriving the cadence from those
+/// "grants" would collapse it to the 500 ms floor within a few beats and
+/// burn `max_extensions` in seconds. The lead-clamp regime instead holds
+/// the cadence at min(requested/2, 30 s) = 1500 ms: over ~4.7 s the
+/// heartbeat sends 4-5 extends (one extra is tolerated while the very
+/// first, near-zero-elapsed beat classifies), where a floor-collapsed
+/// cadence would have sent ~9.
+#[tokio::test]
+async fn heartbeat_lead_clamp_holds_cadence_instead_of_collapsing() {
+    let server = MockServer::start().await;
+    let rsv_id = "rsv_hb_leadclamp";
+    const TTL: u64 = 3_000;
+
+    mount_reserve(&server, rsv_id, initial_expiry(TTL)).await;
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(LeadClampEcho::holding(initial_expiry(TTL)))
+        .mount(&server)
+        .await;
+
+    let guard = do_reserve(&server, TTL).await;
+
+    // Held cadence is min(3000/2, 30 s) = 1500 ms. Depending on whether the
+    // immediate first beat's few-ms "grant" rounds to zero (→ held at once)
+    // or stays positive (→ one 500 ms beat before the regime engages),
+    // extends land at 0/1500/3000/... or 0/500/2000/3500/...
+    tokio::time::sleep(Duration::from_millis(3_250)).await;
+    let after_3s = extend_calls(&server, rsv_id, TTL).await;
+    assert!(
+        (3..=4).contains(&after_3s),
+        "lead-clamp cadence must hold at 1500 ms (3-4 extends by 3.25 s); \
+         a floor-collapsed cadence would have sent ~7, got {after_3s}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_400)).await;
+    let after_4s = extend_calls(&server, rsv_id, TTL).await;
+    assert!(
+        (4..=5).contains(&after_4s),
+        "lead-clamp cadence must stay held (4-5 extends by 4.65 s); a \
+         floor-collapsed cadence would have sent ~9, got {after_4s}"
+    );
+    assert!(
+        after_4s > after_3s,
+        "the heartbeat must keep extending at the held cadence (liveness)"
+    );
+
+    guard.release("test done").await.unwrap();
+}
+
+/// A server that grants NOTHING (every extend echoes the same expiry) on
+/// the immediate first beat primes the lead-clamp regime at once: the
+/// zero grant must not collapse the cadence to the 500 ms floor — beats
+/// hold at min(requested/2, 30 s) = 1000 ms and keep attempting (the lead
+/// bound is negative, so no beat ever skips).
+#[tokio::test]
+async fn heartbeat_zero_grant_immediate_prime_holds_cadence() {
+    let server = MockServer::start().await;
+    let rsv_id = "rsv_hb_zerogrant";
+    const TTL: u64 = 2_000;
+
+    mount_reserve(&server, rsv_id, initial_expiry(TTL)).await;
+    // Every extend returns the SAME expiry the reserve reported: grant 0.
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "ACTIVE",
+            "expires_at_ms": initial_expiry(TTL)
+        })))
+        .mount(&server)
+        .await;
+
+    let guard = do_reserve(&server, TTL).await;
+
+    tokio::time::sleep(MARGIN).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, TTL).await,
+        1,
+        "the first beat is immediate and observes a zero grant"
+    );
+
+    // Beats hold at 1000 ms: 0/1000/2000 → exactly 3 attempts by 2.45 s.
+    // A floor-collapsed cadence (500 ms) would have made ~5.
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, TTL).await,
+        3,
+        "zero grants must hold the cadence at min(requested/2, 30 s), \
+         never collapse to the 500 ms floor"
     );
 
     guard.release("test done").await.unwrap();
@@ -527,9 +630,9 @@ async fn heartbeat_clamped_grant_extends_every_beat() {
 /// counts as **applied**: a 2xx means the server DID extend, and its
 /// `expires_at_ms` is authoritative. The heartbeat feeds it into the grant
 /// ledger (warning only) — pinned by the fresh key on beat 2 (a failure
-/// would have kept the key) and by beat 5 skipping exactly as in the
+/// would have kept the key) and by beat 4 skipping exactly as in the
 /// all-ACTIVE cadence (a failure would have left the grant uncounted and
-/// beat 5 extending).
+/// beat 4 extending).
 #[tokio::test]
 async fn heartbeat_2xx_unknown_status_counts_as_applied() {
     let server = MockServer::start().await;
@@ -551,29 +654,30 @@ async fn heartbeat_2xx_unknown_status_counts_as_applied() {
 
     let guard = reserve_with_ttl(&server, rsv_id, TTL).await;
 
-    tokio::time::sleep(BEAT + MARGIN).await;
+    tokio::time::sleep(MARGIN).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
         1,
-        "beat 1 extends and receives the unknown-status 200"
+        "the immediate beat extends and receives the unknown-status 200"
     );
 
     tokio::time::sleep(BEAT).await;
     let bodies = extend_bodies(&server, rsv_id, TTL).await;
-    assert_eq!(bodies.len(), 2, "beat 2 extends (lead_min 0)");
+    assert_eq!(bodies.len(), 2, "beat 2 extends (lead_min 1000 < 3000)");
     assert_ne!(
         bodies[0]["idempotency_key"], bodies[1]["idempotency_key"],
         "the unknown-status 200 resolved the attempt: beat 2 must use a \
          fresh key, not retry the old one"
     );
 
-    // Beats 3 and 4 extend; beat 5 skips (lead_min 8000 − 5000 = 3000 =
-    // 1.5·grant) — proof the SUSPENDED response's grant entered the ledger.
-    tokio::time::sleep(BEAT + BEAT + BEAT).await;
+    // Beat 3 extends (lead_min 2000); beat 4 skips (lead_min 6000 − 3000 =
+    // 3000 = 1.5·grant) — proof the SUSPENDED response's grant entered the
+    // ledger.
+    tokio::time::sleep(BEAT + BEAT).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
-        4,
-        "a 2xx with unknown status must count as applied: beat 5 skips"
+        3,
+        "a 2xx with unknown status must count as applied: beat 4 skips"
     );
 
     guard.release("test done").await.unwrap();

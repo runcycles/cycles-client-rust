@@ -8,7 +8,7 @@
 
 ---
 
-## 2026-07-27 — heartbeat extend-drift fix, grant-ledger v2.2 (v0.3.1)
+## 2026-07-27 — heartbeat extend-drift fix, grant-ledger v2.3 (v0.3.1)
 
 P1 liveness, fleet-wide (same bug in all four SDKs). The spec's `extend_by_ms`
 is relative to the reservation's *current* `expires_at_ms`, not request time,
@@ -29,32 +29,47 @@ correctness input — RFC 9110 `Date` is a whole-second best-effort
 *origination* timestamp replaceable by intermediaries, and in cycles-server
 `expires_at_ms` comes from Redis `TIME` while `Date` comes from the HTTP
 layer (not the same clock), so the difference is no lease measurement and the
-1000 ms upward clamp fabricated lease. Final **grant-ledger (v2.2)** design:
-correctness rests on `lead_min = grants_sum − elapsed` (signed, starts 0), a
-rigorous lower bound built only from same-frame arithmetic — each grant is
-the difference of successive server-frame `expires_at_ms` values (reserve's
-threaded from the guard, then each extend response's), elapsed is
-client-monotonic to the beat's intended instant. Skip iff a grant sample
-exists and `lead_min ≥ 1.5·last_grant`; else extend by the **requested**
-`ttl_ms`. Per-beat delays replace the fixed interval: first beat
-`min(requested/2, 30 s, date_hint/2)` (the `Date`-derived estimate survives
-only as this raw, unclamped cadence hint — `ApiResponse::date_ms`, `httpdate`
-direct dep), then `clamp(last_grant/2, 500 ms, requested/2)`, so the cadence
-tracks observed grants (clamped grants speed it up); transient failures retry
-at the current cadence with the same idempotency key (replay dedupe); beats
-schedule from intended instants and realign to now after stalls
-(`MissedTickBehavior::Skip` equivalent, hand-rolled for variable delays). Any
-2xx counts as applied (`expires_at_ms` authoritative, warn on odd status);
-permanent codes (`RESERVATION_EXPIRED`/`RESERVATION_FINALIZED`/
-`MAX_EXTENSIONS_EXCEEDED`/`TENANT_CLOSED`/`NOT_FOUND` or HTTP 410/404) stop
-the heartbeat. Cancellation unchanged. Ten wiremock tests with dynamic expiry
-responders (cadence extend@1..4/skip@5/extend@6; capped grant keeping
-`extend_by_ms` at the request while beating at hint/2 then grant/2; garbage
-`Date` → requested/2; key reuse; permanent stops; small-ttl liveness; clamped
-grants never skipping; unknown-status 200 as applied) + extracted pure
-delay/lead functions unit-tested (incl. the 30 s first-beat cap and raw
-unclamped hint) in `src/heartbeat.rs`; `Date`-parsing unit tests in
-`src/response.rs`. Coverage 95.73%; tests, clippy `-D warnings`, fmt green.
+1000 ms upward clamp fabricated lease. Spec review round 4 then removed
+lease estimation from scheduling entirely: any *bounded* first-beat delay
+can outlive a small capped lease, so the **first extend fires immediately**
+(costs one extension, provably beats an arbitrarily small grant, and primes
+the ledger with a real sample; `ApiResponse::date_ms`/`httpdate` stay as
+general response utilities the heartbeat no longer consumes). Round 4 also
+found that under a server-side **maximum-LEAD clamp** (extend re-stamps
+`expires_at ≈ now + L`) successive `expires_at_ms` differences measure
+*elapsed time, not lease* — grant-derived cadence is self-referential there
+and collapses to the 500 ms floor, burning `max_extensions` in seconds.
+Final **grant-ledger (v2.3)** design: correctness rests on
+`lead_min = grants_sum − elapsed` (signed, starts 0), a rigorous lower bound
+built only from same-frame arithmetic — each grant is the difference of
+successive server-frame `expires_at_ms` values (reserve's threaded from the
+guard, then each extend response's), elapsed is client-monotonic to the
+beat's intended instant. Skip iff a grant sample exists and
+`lead_min ≥ 1.5·last_grant`; else extend by the **requested** `ttl_ms`.
+Per-beat delays replace the fixed interval: first beat immediate, then
+`clamp(grant/2, 500 ms, requested/2)` (clamped grants speed it up) — unless
+`is_lead_clamp_grant` classifies the grant as a clock reading (non-positive,
+or `< 0.9·requested` while within `[0.75, 1.25]×` elapsed-since-last-
+success), which holds the cadence at `min(requested/2, 30 s)` and warns once
+per heartbeat; the same held cadence paces retries before any grant sample,
+so a failed immediate beat cannot hot-loop. Transient failures retry with
+the same idempotency key (replay dedupe); beats schedule from intended
+instants and realign to now after stalls (`MissedTickBehavior::Skip`
+equivalent, hand-rolled for variable delays). Any 2xx counts as applied
+(`expires_at_ms` authoritative, warn on odd status); permanent codes
+(`RESERVATION_EXPIRED`/`RESERVATION_FINALIZED`/`MAX_EXTENSIONS_EXCEEDED`/
+`TENANT_CLOSED`/`NOT_FOUND` or HTTP 410/404) stop the heartbeat.
+Cancellation unchanged. Eleven wiremock tests with dynamic expiry responders
+(immediate first beat + extend@0/1000/2000, skip@3000, extend@4000; capped
+grant keeping `extend_by_ms` at the request while the immediate beat
+discovers the cap; 503 on the immediate beat → single held-cadence retry
+with the same key; permanent stops; small-ttl liveness; per-extend grant
+clamp still tightening to grant/2; lead-clamp echo responder holding
+cadence instead of collapsing; zero-grant immediate prime holding cadence;
+unknown-status 200 as applied) + extracted pure cadence/regime functions
+unit-tested (incl. the 30 s held-cadence cap and the lead-clamp band
+boundaries) in `src/heartbeat.rs`; `Date`-parsing unit tests in
+`src/response.rs`. Coverage 95.12%; tests, clippy `-D warnings`, fmt green.
 
 ## 2026-07-27 — v0.3.0 self-review hardening
 

@@ -1,6 +1,6 @@
 //! Background TTL extension (heartbeat) for active reservations.
 //!
-//! # Grant-ledger design (v2.2)
+//! # Grant-ledger design (v2.3)
 //!
 //! The protocol's `extend_by_ms` is relative to the reservation's **current
 //! `expires_at_ms`**, not to request time (`cycles-protocol-v0.yaml`), so the
@@ -8,21 +8,24 @@
 //! blindly extending every beat drifts the expiry outward, and fixed
 //! skip-every-other-beat cadences lapse for small TTLs or clamped grants.
 //!
-//! ## Why the HTTP `Date` header is only a hint
+//! ## The first beat is immediate
 //!
-//! An earlier revision derived an "effective TTL" from the reserve
-//! response's `expires_at_ms` minus its HTTP `Date` header and let it drive
-//! the whole scheduler. Spec review (round 3) rejected that as a correctness
-//! input: RFC 9110's `Date` is a whole-second, best-effort *origination*
-//! timestamp that intermediaries may replace, and in cycles-server
-//! `expires_at_ms` is stamped from Redis `TIME` while `Date` comes from the
-//! HTTP layer — they are **not the same clock**, so their difference is not
-//! a trustworthy lease measurement. Worse, clamping the difference upward
-//! (the old 1000 ms floor) *fabricated* lease the server never granted. The
-//! `Date`-derived estimate survives only as a **first-beat cadence hint**
-//! ([`date_ttl_hint_ms`] / [`first_beat_delay_ms`]): it can pull the first
-//! beat earlier when the server appears to have capped the grant, but no
-//! correctness property depends on it, and it is never clamped upward.
+//! A tenant policy (`max_reservation_ttl_ms`) may silently cap the granted
+//! lease far below the requested TTL, and the create response carries no
+//! effective-TTL field. Spec review round 4 established that **any bounded
+//! first-beat delay can outlive a small capped lease** — a 30 s cap is still
+//! 28 s too late for a 2 s grant. Two earlier revisions tried to *estimate*
+//! the lease before the first beat (round 2: an "effective TTL" from
+//! `expires_at_ms − Date`; round 3: the same difference demoted to a raw
+//! cadence hint after review showed RFC 9110 `Date` is a whole-second,
+//! best-effort origination timestamp from a different clock than the
+//! Redis-`TIME`-stamped `expires_at_ms`). v2.3 removes estimation from the
+//! scheduling path entirely: the **first extend fires immediately**. It costs
+//! one extension from the allowance, but it is the only delay that provably
+//! cannot outlive an arbitrarily small lease — and its response primes the
+//! grant ledger with a *real* grant sample, which every later beat is paced
+//! by. (`ApiResponse::date_ms` and the `httpdate` parsing remain available
+//! as general response utilities; the heartbeat no longer consumes them.)
 //!
 //! ## Correctness: a conservative lead lower bound
 //!
@@ -51,19 +54,44 @@
 //! **requested** `ttl_ms`. Until the first successful extend there is no
 //! grant sample, so every beat extends — liveness first.
 //!
-//! ## Cadence
+//! ## Cadence and the lead-clamp regime
 //!
 //! Beat delays are computed per beat, not from a fixed interval:
 //!
-//! - **first beat**: `min(requested_ttl/2, 30 s, date_hint/2)` (the hint arm
-//!   only when derivable and > 0) — the 30 s cap bounds the damage when a
-//!   silently-capped grant made the requested TTL a wild overestimate;
-//! - **after a success**: `clamp(last_grant/2, 500 ms, requested_ttl/2)` —
-//!   the cadence tracks what the server actually grants (clamped grants →
-//!   faster beats), floored at 500 ms so tiny/zero grants cannot busy-loop;
-//! - **after a transient failure**: unchanged — retry at the current cadence
-//!   with the **same idempotency key** (the server replays the original
-//!   outcome, so an applied-but-lost extension cannot double-extend).
+//! - **first beat**: immediate (see above);
+//! - **after a success in the grant regime**:
+//!   `clamp(grant/2, 500 ms, requested_ttl/2)` — the cadence tracks what the
+//!   server actually grants (clamped grants → faster beats), floored at
+//!   500 ms so tiny grants cannot busy-loop;
+//! - **after a success in the LEAD-CLAMP regime**: held at
+//!   `min(requested_ttl/2, 30 s)`, never tightened (see below);
+//! - **after a transient failure**: retry at the current cadence with the
+//!   **same idempotency key** (the server replays the original outcome, so
+//!   an applied-but-lost extension cannot double-extend).
+//!
+//! **Why the lead-clamp regime exists** (spec review round 4): a server may
+//! enforce a *maximum lead* — every extend re-stamps `expires_at ≈ now + L`
+//! rather than adding lease. Under such a clamp, successive `expires_at_ms`
+//! differences measure **elapsed time, not granted lease**, so deriving the
+//! cadence from them is self-referential: the observed "grant" shrinks to
+//! whatever the cadence is, the cadence halves in response, and within a few
+//! beats it collapses to the 500 ms floor — burning the server's
+//! `max_extensions` allowance in seconds. Grant-derived cadence is only
+//! valid for real per-extend grants. Each success is therefore classified by
+//! [`is_lead_clamp_grant`]: a grant that is non-positive, or that is both
+//! well short of the requested amount (`< 0.9·requested`) and approximately
+//! equal to the elapsed time since the last success (within
+//! `[0.75, 1.25]·elapsed` — the signature of a clock reading rather than a
+//! lease), puts the beat in the lead-clamp regime: cadence held at
+//! `min(requested/2, 30 s)` and a `tracing::warn` emitted once per heartbeat
+//! (the allowance is still depleting — just at the held pace, not the
+//! floor's). The lower `0.75·elapsed` arm is what lets a *real* but small
+//! per-extend grant recover: after a skip doubles the inter-success gap, a
+//! fixed grant falls below the band and the cadence tightens again, whereas
+//! a lead-clamped "grant" tracks the gap and stays inside the band. (A
+//! server granting less than twice the 500 ms floor per extend is
+//! observationally indistinguishable from a lead clamp at floor cadence and
+//! is conservatively held too.)
 //!
 //! Each next beat is scheduled from the previous beat's *intended* instant
 //! (`intended + delay`), so extend round-trips do not slip the cadence; if
@@ -92,37 +120,49 @@ use crate::error::Error;
 use crate::models::enums::{ErrorCode, ExtendStatus};
 use crate::models::{ExtendRequest, IdempotencyKey, ReservationId};
 
-/// Hard cap on the first-beat delay. Even a huge requested TTL gets its
-/// first beat within 30 s, bounding how late the heartbeat discovers a
-/// silently-capped grant when no usable `Date` hint exists.
-const FIRST_BEAT_DELAY_CAP_MS: u64 = 30_000;
+/// Hard cap on the held (lead-clamp / pre-first-sample) cadence. Even a
+/// huge requested TTL beats at least every 30 s while the grant signal is
+/// untrusted.
+const HELD_CADENCE_CAP_MS: u64 = 30_000;
 
 /// Floor on post-success beat delays: even zero or tiny grants retry at
 /// 500 ms, never a busy loop.
 const MIN_BEAT_DELAY_MS: u64 = 500;
 
-/// The `Date`-derived TTL estimate: `expires_at_ms − date_ms`, both from the
-/// reserve response, **raw** (saturating at 0) — no clamping in either
-/// direction, because this is a cadence *hint*, not a lease measurement (see
-/// module docs: `Date` is not the same clock as `expires_at_ms`, and an
-/// upward clamp would fabricate lease). `None` when either sample is
-/// missing.
-pub(crate) fn date_ttl_hint_ms(expires_at_ms: Option<u64>, date_ms: Option<u64>) -> Option<u64> {
-    match (expires_at_ms, date_ms) {
-        (Some(expires), Some(date)) => Some(expires.saturating_sub(date)),
-        _ => None,
-    }
+/// The cadence held whenever the grant signal cannot be trusted:
+/// `min(requested/2, 30 s)`. Used for the lead-clamp regime, and for retry
+/// pacing before the first successful extend has produced a grant sample.
+/// (`reserve()` validates `requested_ttl_ms ≥ 1000`, so this is ≥ 500 ms;
+/// the `.max(1)` keeps it non-zero even if that invariant ever changes.)
+fn held_cadence_ms(requested_ttl_ms: u64) -> u64 {
+    (requested_ttl_ms / 2).clamp(1, HELD_CADENCE_CAP_MS)
 }
 
-/// Delay before the first beat: `min(requested/2, 30 s cap, hint/2)`, the
-/// hint arm only when derivable and non-zero. `.max(1)` keeps the delay
-/// non-zero even for a degenerate (sub-2 ms) hint.
-pub(crate) fn first_beat_delay_ms(requested_ttl_ms: u64, date_ttl_hint_ms: Option<u64>) -> u64 {
-    let mut delay = (requested_ttl_ms / 2).min(FIRST_BEAT_DELAY_CAP_MS);
-    if let Some(hint) = date_ttl_hint_ms.filter(|&h| h > 0) {
-        delay = delay.min(hint / 2);
+/// `true` when a successful extend's observed grant is better explained by a
+/// maximum-LEAD clamp (server re-stamps `expires_at ≈ now + L` instead of
+/// adding lease) than by a real per-extend grant. Under such a clamp,
+/// successive `expires_at_ms` differences measure **elapsed time, not
+/// lease**, so pacing the cadence by them collapses it to the 500 ms floor
+/// and burns `max_extensions` in seconds (see module docs).
+///
+/// Classified lead-clamp when the grant is non-positive, or is both well
+/// short of the requested amount (`grant < 0.9·requested` — a full or
+/// near-full grant is trusted regardless) and approximately equal to the
+/// elapsed time since the last success (`0.75·elapsed ≤ grant ≤
+/// 1.25·elapsed` — a clock reading, not a lease). A real grant fails the
+/// band: in steady state the cadence is half the grant (`grant ≈
+/// 2·elapsed`), and after a skip doubles the gap a fixed grant falls to
+/// `≈ 0.5·elapsed` — below the band, so a genuinely clamped-but-real grant
+/// tightens again instead of decaying at the held cadence. Integer
+/// arithmetic throughout (`×10/×9`, `×4/×5`, `×4/×3`).
+fn is_lead_clamp_grant(grant_ms: i128, requested_ttl_ms: u64, elapsed_ms: u128) -> bool {
+    if grant_ms <= 0 {
+        return true;
     }
-    delay.max(1)
+    let elapsed = i128::try_from(elapsed_ms).unwrap_or(i128::MAX / 8);
+    10 * grant_ms < 9 * i128::from(requested_ttl_ms)
+        && 4 * grant_ms <= 5 * elapsed
+        && 4 * grant_ms >= 3 * elapsed
 }
 
 /// Delay after a successful extend: half the observed grant, floored at
@@ -197,8 +237,9 @@ fn advance(intended: tokio::time::Instant, delay: Duration) -> tokio::time::Inst
 /// reservations), the first grant cannot be measured and falls back to the
 /// requested amount.
 ///
-/// `date_ttl_hint_ms` is the raw `Date`-derived TTL estimate from
-/// [`date_ttl_hint_ms`] — a first-beat cadence hint only.
+/// The first beat fires **immediately** — the only first-beat delay that
+/// provably cannot outlive an arbitrarily small tenant-capped lease (see
+/// module docs).
 ///
 /// Returns a `JoinHandle` that can be used to await the task. Cancel the
 /// provided `CancellationToken` to stop the heartbeat. The task also stops
@@ -209,7 +250,6 @@ pub(crate) fn start_heartbeat(
     reservation_id: ReservationId,
     requested_ttl_ms: u64,
     initial_expires_at_ms: Option<u64>,
-    date_ttl_hint_ms: Option<u64>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -218,17 +258,23 @@ pub(crate) fn start_heartbeat(
         // elapsed_ms over-counts server elapsed time and lead_min stays a
         // lower bound.
         let anchor = tokio::time::Instant::now();
-        let mut delay =
-            Duration::from_millis(first_beat_delay_ms(requested_ttl_ms, date_ttl_hint_ms));
+        // Cadence used after a failure before any grant sample exists; the
+        // FIRST beat itself is immediate (next_beat == anchor).
+        let mut delay = Duration::from_millis(held_cadence_ms(requested_ttl_ms));
         // The upcoming beat's *intended* instant; lead math measures elapsed
         // to this, keeping it an exact sum of the scheduled delays.
-        let mut next_beat = anchor + delay;
+        let mut next_beat = anchor;
 
         // Grant ledger: previous known server-frame expiry, sum of observed
         // grants, and the most recent grant (None until the first success).
         let mut prev_expiry = initial_expires_at_ms;
         let mut grants_sum_ms: i128 = 0;
         let mut last_grant_ms: Option<u64> = None;
+        // Intended instant of the last successful extend (initially the
+        // anchor): the elapsed base for lead-clamp classification.
+        let mut last_success = anchor;
+        // The lead-clamp warning fires once per heartbeat, not per beat.
+        let mut warned_lead_clamp = false;
         // Set while an extend outcome is unresolved (transient failure):
         // reused on the retry so a lost response cannot double-extend.
         let mut pending_key: Option<IdempotencyKey> = None;
@@ -255,20 +301,49 @@ pub(crate) fn start_heartbeat(
                 Ok(resp) => {
                     pending_key = None;
                     // The grant is the difference of successive server-frame
-                    // expiries. `ExtendResponse::expires_at_ms` is
-                    // structurally required, so the only possible missing
+                    // expiries (signed — an expiry that moved backwards is a
+                    // negative grant, classified lead-clamp and counted as
+                    // zero in the ledger). `ExtendResponse::expires_at_ms`
+                    // is structurally required, so the only possible missing
                     // sample is a reserve response without expires_at_ms
                     // (non-conformant server): fall back to the requested
-                    // amount. saturating_sub: an expiry that moved backwards
-                    // counts as a zero grant (conservative).
-                    let grant = match prev_expiry {
-                        Some(prev) => resp.expires_at_ms.saturating_sub(prev),
-                        None => requested_ttl_ms,
+                    // amount.
+                    let grant: i128 = match prev_expiry {
+                        Some(prev) => i128::from(resp.expires_at_ms) - i128::from(prev),
+                        None => i128::from(requested_ttl_ms),
                     };
                     prev_expiry = Some(resp.expires_at_ms);
-                    grants_sum_ms += i128::from(grant);
-                    last_grant_ms = Some(grant);
-                    delay = Duration::from_millis(next_beat_delay_ms(grant, requested_ttl_ms));
+                    let elapsed_since_success = next_beat.duration_since(last_success).as_millis();
+                    last_success = next_beat;
+                    // Ledger counts max(grant, 0); the skip rule and cadence
+                    // never see negative amounts.
+                    let counted = u64::try_from(grant.max(0)).unwrap_or(u64::MAX);
+                    grants_sum_ms += i128::from(counted);
+                    last_grant_ms = Some(counted);
+                    if is_lead_clamp_grant(grant, requested_ttl_ms, elapsed_since_success) {
+                        // The observed "grant" tracks elapsed time, not the
+                        // requested lease: pacing by it would collapse the
+                        // cadence to the floor and burn max_extensions in
+                        // seconds. Hold at min(requested/2, 30 s) instead.
+                        delay = Duration::from_millis(held_cadence_ms(requested_ttl_ms));
+                        if !warned_lead_clamp {
+                            warned_lead_clamp = true;
+                            tracing::warn!(
+                                reservation_id = %reservation_id,
+                                grant_ms = %grant,
+                                elapsed_ms = %elapsed_since_success,
+                                requested_ttl_ms,
+                                held_cadence_ms = held_cadence_ms(requested_ttl_ms),
+                                "extend grants track elapsed time, not the requested \
+                                 lease — server appears to clamp the reservation's \
+                                 maximum lead; holding heartbeat cadence to avoid \
+                                 depleting the extension allowance"
+                            );
+                        }
+                    } else {
+                        delay =
+                            Duration::from_millis(next_beat_delay_ms(counted, requested_ttl_ms));
+                    }
                     // Any 2xx means the server applied the extension;
                     // `expires_at_ms` (required by the spec response schema)
                     // is authoritative regardless of the status string.
@@ -343,37 +418,80 @@ mod tests {
     }
 
     #[test]
-    fn full_grant_trace_extends_four_beats_then_skips() {
-        // grants == requested, 1000 ms beats: extend@1..4, skip@5 (bound
-        // exactly 1.5·grant), extend@6 — the v2.2 steady state.
+    fn full_grant_trace_extends_three_beats_then_alternates() {
+        // grants == requested, immediate first beat then 1000 ms beats
+        // (beat i fires at (i−1)·1000): extend@1..3 (bounds 0, 1000, 2000
+        // against the 1.5·grant = 3000 threshold), skip@4 (bound exactly
+        // 3000, inclusive), extend@5, skip@6 — the v2.3 steady state.
         let mut grants: i128 = 0;
         let mut extends = Vec::new();
         for beat in 1u128..=6 {
-            let lead = lead_min_ms(grants, beat * 1_000);
+            let lead = lead_min_ms(grants, (beat - 1) * 1_000);
             let skip = should_skip(lead, if beat == 1 { None } else { Some(REQUESTED) });
             extends.push(!skip);
             if !skip {
                 grants += i128::from(REQUESTED);
             }
         }
-        assert_eq!(extends, [true, true, true, true, false, true]);
+        assert_eq!(extends, [true, true, true, false, true, false]);
     }
 
     #[test]
-    fn first_beat_delay_pins() {
-        // requested 2000, no hint → requested/2 = 1000.
-        assert_eq!(first_beat_delay_ms(2_000, None), 1_000);
-        // Large requested, no hint → the 30 s cap.
-        assert_eq!(first_beat_delay_ms(86_400_000, None), 30_000);
-        // Capped-grant shape: requested 8000, hint 2000 → hint/2 = 1000.
-        assert_eq!(first_beat_delay_ms(8_000, Some(2_000)), 1_000);
-        // A hint larger than the request never delays past requested/2.
-        assert_eq!(first_beat_delay_ms(2_000, Some(10_000)), 1_000);
-        // A zero hint (expiry at or before Date — the raw, unclamped
-        // estimate) is ignored, not treated as "beat immediately".
-        assert_eq!(first_beat_delay_ms(2_000, Some(0)), 1_000);
-        // Degenerate 1 ms hint: hint/2 floors to 0, kept non-zero.
-        assert_eq!(first_beat_delay_ms(2_000, Some(1)), 1);
+    fn held_cadence_pins() {
+        // requested/2 below the cap.
+        assert_eq!(held_cadence_ms(2_000), 1_000);
+        // Spec-minimum TTL.
+        assert_eq!(held_cadence_ms(1_000), 500);
+        // Huge requested TTL → the 30 s cap. (Impractical to wait out in a
+        // wall-clock test — pinned here.)
+        assert_eq!(held_cadence_ms(86_400_000), 30_000);
+        assert_eq!(held_cadence_ms(60_000), 30_000);
+        // Degenerate sub-spec TTL stays non-zero.
+        assert_eq!(held_cadence_ms(1), 1);
+    }
+
+    #[test]
+    fn lead_clamp_zero_or_negative_grant_always_holds() {
+        // A zero grant on the immediate first beat (elapsed 0) is the
+        // canonical lead-clamp prime: hold, never derive a cadence from it.
+        assert!(is_lead_clamp_grant(0, REQUESTED, 0));
+        // Expiry moved backwards.
+        assert!(is_lead_clamp_grant(-500, REQUESTED, 1_000));
+        assert!(is_lead_clamp_grant(0, REQUESTED, 10_000));
+    }
+
+    #[test]
+    fn lead_clamp_full_grant_is_trusted_regardless_of_elapsed() {
+        // grant ≥ 0.9·requested is never classified lead-clamp, even when
+        // it happens to equal elapsed (e.g. a retry after a long outage).
+        assert!(!is_lead_clamp_grant(2_000, REQUESTED, 2_000));
+        // Boundary: exactly 0.9·requested is trusted (strict <).
+        assert!(!is_lead_clamp_grant(1_800, REQUESTED, 1_800));
+        // Just below 0.9·requested inside the band is not.
+        assert!(is_lead_clamp_grant(1_799, REQUESTED, 1_799));
+    }
+
+    #[test]
+    fn lead_clamp_band_is_0_75_to_1_25_of_elapsed() {
+        // The signature of a maximum-lead clamp: the "grant" tracks elapsed
+        // time. requested 8000 so the 0.9·requested arm is inactive.
+        const REQ: u64 = 8_000;
+        // Ratio 1.0 → clamp.
+        assert!(is_lead_clamp_grant(1_000, REQ, 1_000));
+        // Upper edge inclusive: grant = 1.25·elapsed.
+        assert!(is_lead_clamp_grant(1_250, REQ, 1_000));
+        assert!(!is_lead_clamp_grant(1_251, REQ, 1_000));
+        // Lower edge inclusive: grant = 0.75·elapsed.
+        assert!(is_lead_clamp_grant(750, REQ, 1_000));
+        // Below the band: a REAL fixed grant observed across a skip-doubled
+        // gap (grant ≈ 0.5·elapsed) must NOT hold — it tightens again.
+        assert!(!is_lead_clamp_grant(749, REQ, 1_000));
+        assert!(!is_lead_clamp_grant(1_000, REQ, 2_000));
+        // Steady-state real grant (cadence = grant/2 → grant = 2·elapsed).
+        assert!(!is_lead_clamp_grant(2_000, REQ, 1_000));
+        // Immediate first beat (elapsed 0): any positive grant is taken at
+        // face value — the regime is re-evaluated on the next beat.
+        assert!(!is_lead_clamp_grant(5, REQ, 0));
     }
 
     #[test]
@@ -389,25 +507,6 @@ mod tests {
         // Capped-grant scenario from the wiremock suite: requested 8000,
         // grants of 2000 → 1000 ms beats.
         assert_eq!(next_beat_delay_ms(2_000, 8_000), 1_000);
-    }
-
-    #[test]
-    fn date_hint_is_raw_and_unclamped() {
-        let date = 1_700_000_000_000;
-        // The old code clamped 200 up to 1000 (fabricating lease); the hint
-        // is raw.
-        assert_eq!(date_ttl_hint_ms(Some(date + 200), Some(date)), Some(200));
-        // Expiry at or before Date saturates to 0 (callers ignore 0).
-        assert_eq!(date_ttl_hint_ms(Some(date - 5_000), Some(date)), Some(0));
-        // Larger than any request is fine — first_beat_delay_ms bounds it.
-        assert_eq!(
-            date_ttl_hint_ms(Some(date + 3_600_000), Some(date)),
-            Some(3_600_000)
-        );
-        // Missing either sample → no hint.
-        assert_eq!(date_ttl_hint_ms(None, Some(date)), None);
-        assert_eq!(date_ttl_hint_ms(Some(date), None), None);
-        assert_eq!(date_ttl_hint_ms(None, None), None);
     }
 
     #[test]

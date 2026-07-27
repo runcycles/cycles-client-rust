@@ -83,21 +83,20 @@ impl ReservationGuard {
         expires_at_ms: Option<u64>,
         affected_scopes: Vec<String>,
         requested_ttl_ms: u64,
-        date_ttl_hint_ms: Option<u64>,
         subject: Subject,
         action: Action,
     ) -> Self {
         let cancel = CancellationToken::new();
         // The reserve response's expires_at_ms (server frame) is the base of
-        // the heartbeat's grant ledger; the Date-derived TTL estimate is a
-        // first-beat cadence hint only (the Date header is not the same
-        // clock as expires_at_ms); see src/heartbeat.rs module docs.
+        // the heartbeat's grant ledger. The first extend fires immediately —
+        // a tenant policy may have silently capped the lease far below the
+        // requested TTL, and no bounded delay provably beats an arbitrarily
+        // small grant; see src/heartbeat.rs module docs.
         let heartbeat = start_heartbeat(
             client.clone(),
             id.clone(),
             requested_ttl_ms,
             expires_at_ms,
-            date_ttl_hint_ms,
             cancel.clone(),
         );
 
