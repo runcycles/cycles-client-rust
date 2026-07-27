@@ -8,6 +8,17 @@
 
 ---
 
+## 2026-07-27 — workflow dependency maintenance
+
+Dependabot PRs #71 and #72 update the full-SHA workflow pins for
+`actions/checkout` from 7.0.0 to 7.0.1 and OSSF Scorecard from 2.4.3 to 2.4.4.
+The checkout patch hardens ref normalization and command argument handling;
+Scorecard now carries 5.5.0 and no longer fails the whole action when result
+publication fails. Client source, Cargo manifests and lockfile, the published
+crate, public types, and protocol behavior are unchanged. Rust stable and MSRV
+1.88 tests, cargo audit, CodeQL, and the remaining repository checks passed on
+the reviewed heads.
+
 ## Summary
 
 | Category                      | Pass  | Issues |
