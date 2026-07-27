@@ -87,7 +87,15 @@ impl ReservationGuard {
         action: Action,
     ) -> Self {
         let cancel = CancellationToken::new();
-        let heartbeat = start_heartbeat(client.clone(), id.clone(), ttl_ms, cancel.clone());
+        // The reserve response's expires_at_ms (server frame) seeds the
+        // heartbeat's lead estimate; see src/heartbeat.rs module docs.
+        let heartbeat = start_heartbeat(
+            client.clone(),
+            id.clone(),
+            ttl_ms,
+            expires_at_ms,
+            cancel.clone(),
+        );
 
         Self {
             client,

@@ -8,21 +8,33 @@
 
 ---
 
-## 2026-07-27 — heartbeat extend-drift fix (v0.3.1)
+## 2026-07-27 — heartbeat extend-drift fix, lead-estimate redesign (v0.3.1)
 
 P1 liveness, fleet-wide (same bug in all four SDKs). The spec's `extend_by_ms`
 is relative to the reservation's *current* `expires_at_ms`, not request time,
 but `src/heartbeat.rs` extended by `ttl_ms` on every `ttl/2` beat — drifting
 the expiry outward `ttl/2` per beat (kill the process and the reserved budget
 stays locked until the drifted expiry, up to ~6×ttl at default
-`max_extensions`) and burning extensions twice as fast as needed. Fixed with
-alternate-beat extension: first beat extends, each successful `ACTIVE` extend
-skips exactly one beat, a failed extend (Err or non-`ACTIVE` status, incl.
-forward-compat `Unknown`) retries next beat; extend amount stays `ttl_ms`; no
-client-vs-server clock comparison (skew-unsafe). Expiry lead now oscillates in
-`[ttl/2, 1.5·ttl]` with no drift. Three wiremock cadence tests
-(`tests/heartbeat_test.rs`). Coverage 95.81%; tests, clippy
-`-D warnings`, fmt green.
+`max_extensions`) and burning extensions twice as fast as needed. First cut
+(alternate-beat cadence) was replaced after adversarial self-review found
+confirmed liveness regressions: single-failure retry at zero lead; guaranteed
+lapse for spec-legal ttl in (1000, 2000) under the 1 s interval floor;
+sleep-after-await beat slip; non-`ACTIVE` 2xx treated as failure (every-beat
+drift against any newer server); permanent failures retried forever; fresh
+idempotency key per retry risking double-extend after a lost response. Fixed
+with a **lead-estimate** scheduler: interval exactly `ttl/2` (floor removed),
+beats anchored via `interval_at` + `MissedTickBehavior::Skip`; per beat
+`lead = (known_expiry − initial_expiry) + ttl − elapsed` (server-frame minus
+server-frame, monotonic minus monotonic — never client vs server clock;
+reserve's `expires_at_ms` threaded from the guard); skip iff `lead ≥ 1.5·ttl`,
+else extend by `ttl_ms`. Any 2xx counts as applied (`expires_at_ms`
+authoritative, warn on odd status — reverses the first cut); transient
+failures reuse the same idempotency key next beat (replay dedupe); permanent
+codes (`RESERVATION_EXPIRED`/`RESERVATION_FINALIZED`/`MAX_EXTENSIONS_EXCEEDED`
+or HTTP 410) stop the heartbeat. Cancellation unchanged. Six wiremock tests
+with dynamic expiry responders + lead-math/classification unit tests
+(`tests/heartbeat_test.rs`, `src/heartbeat.rs`). Coverage 95.70%; tests,
+clippy `-D warnings`, fmt green.
 
 ## 2026-07-27 — v0.3.0 self-review hardening
 
