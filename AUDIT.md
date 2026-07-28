@@ -10,6 +10,16 @@
 
 ## 2026-07-27/28 — heartbeat extend-drift fix: `remaining_ttl_ms` normative scheduling + grant-ledger fallback (v0.3.1)
 
+Final self-review correction: the strict success predicate is uniform in both
+server-authoritative and fieldless fallback scheduling. Only a complete,
+schema-valid HTTP 200 create/extend response succeeds; malformed or non-200
+2xx responses remain ambiguous and recover with the same key. The create
+deadline covers the whole attempt, one same-key create recovery is allowed,
+post-receipt setup time is deducted, and reliable pre-field RTT samples stay
+in the safety budget. This supersedes older any-2xx wording below.
+The final suite passes 217 unit/integration tests plus 8 doctests (12 live
+tests ignored); tarpaulin line coverage is 95.17%.
+
 P1 liveness, fleet-wide (same bug in all four SDKs). The spec's `extend_by_ms`
 is relative to the reservation's *current* `expires_at_ms`, not request time,
 but `src/heartbeat.rs` extended by `ttl_ms` on every `ttl/2` beat — drifting

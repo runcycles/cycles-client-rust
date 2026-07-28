@@ -215,6 +215,11 @@ impl CyclesClientBuilder {
     }
 
     /// Provide a pre-configured `reqwest::Client` for connection pool sharing.
+    ///
+    /// Every SDK request still applies the configured
+    /// `connect_timeout + read_timeout` as a complete-attempt deadline. This
+    /// preserves the finite timeout budget required by lease-heartbeat
+    /// scheduling even when the supplied client has no default timeout.
     pub fn http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = Some(client);
         self

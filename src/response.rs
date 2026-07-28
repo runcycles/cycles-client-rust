@@ -26,9 +26,9 @@ pub struct ApiResponse<T> {
     /// as a reservation's `expires_at_ms` (in cycles-server those come from
     /// Redis `TIME` while `Date` comes from the HTTP layer). Treat
     /// cross-source arithmetic like `expires_at_ms − date_ms` as a rough
-    /// estimate at best — the SDK itself derives no behavior from this
-    /// field (the reservation heartbeat schedules its first extend
-    /// immediately rather than estimating the lease; see
+    /// estimate at best — the SDK itself derives no lease behavior from this
+    /// field. Heartbeats use `remaining_ttl_ms` when present and the
+    /// documented best-effort fallback when it is absent (see
     /// `src/heartbeat.rs`).
     pub date_ms: Option<u64>,
 }

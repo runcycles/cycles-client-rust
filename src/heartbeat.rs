@@ -21,7 +21,7 @@
 //!
 //! When a successful response carries the field, scheduling is **normative**
 //! per the spec's HEARTBEAT GUIDANCE (`cycles-protocol-v0.yaml`, spec PR
-//! #148 head `dd60c27`). Only a **schema-valid HTTP 200**
+//! #148; the PR's YAML is authoritative). Only a **schema-valid HTTP 200**
 //! `ReservationExtendResponse` (or the create response, for the first beat)
 //! counts as an observed success; any other or malformed 2xx is *ambiguous*
 //! and handled as a transient failure with same-key recovery. On every
@@ -200,7 +200,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::CyclesClient;
 use crate::error::Error;
-use crate::models::enums::{ErrorCode, ExtendStatus};
+use crate::models::enums::ErrorCode;
 use crate::models::{ExtendRequest, IdempotencyKey, ReservationId};
 
 /// Hard cap on the held (lead-clamp / pre-first-sample) cadence. Even a
@@ -399,8 +399,12 @@ fn recovery_delay_ms(lead_estimate_ms: u64, window_ms: i128) -> u64 {
 /// recovery run — the window shrinks exactly when monotonic elapsed grows,
 /// so a non-decreasing window means a zero-time recovery loop (including
 /// the second failure at a coarse-clock window of 0), which must stop.
-fn recovery_stalled(window_ms: i128, previous_window_ms: Option<i128>) -> bool {
-    previous_window_ms.is_some_and(|prev| window_ms >= prev)
+fn recovery_stalled(
+    window_ms: i128,
+    previous_window_ms: Option<i128>,
+    elapsed_advanced: bool,
+) -> bool {
+    previous_window_ms.is_some_and(|prev| !elapsed_advanced && window_ms >= prev)
 }
 
 /// `true` for failure classes the primary (field-mode) algorithm recovers
@@ -429,7 +433,8 @@ fn is_recoverable_in_field_mode(e: &Error) -> bool {
 ///
 /// `initial_remaining_ttl_ms` is the create response's `remaining_ttl_ms`
 /// (spec PR #148), and `create_rtt_ms` the reserve call's measured round
-/// trip. When the field is present, the first beat and all subsequent
+/// trip. `create_received_at` anchors the sample so local guard setup time is
+/// also deducted before scheduling. When the field is present, the first beat and all subsequent
 /// scheduling are **normative** (exact, server-authoritative); when absent,
 /// the first beat fires **immediately** — the only first-beat delay that
 /// provably cannot outlive an arbitrarily small tenant-capped lease (see
@@ -439,16 +444,24 @@ fn is_recoverable_in_field_mode(e: &Error) -> bool {
 /// provided `CancellationToken` to stop the heartbeat. The task also stops
 /// itself on a permanent extend failure (see
 /// [`is_permanent_extend_failure`]).
+pub(crate) struct CreateLeaseSample {
+    pub(crate) remaining_ttl_ms: Option<u64>,
+    pub(crate) rtt_ms: u64,
+    pub(crate) received_at: tokio::time::Instant,
+}
+
 pub(crate) fn start_heartbeat(
     client: CyclesClient,
     reservation_id: ReservationId,
     requested_ttl_ms: u64,
     initial_expires_at_ms: Option<u64>,
-    initial_remaining_ttl_ms: Option<u64>,
-    create_rtt_ms: u64,
+    create_sample: CreateLeaseSample,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let initial_remaining_ttl_ms = create_sample.remaining_ttl_ms;
+        let create_rtt_ms = create_sample.rtt_ms;
+        let create_received_at = create_sample.received_at;
         // Monotonic anchor for elapsed_ms. Taken when the heartbeat starts,
         // i.e. shortly AFTER the server stamped initial_expires_at_ms — so
         // elapsed_ms over-counts server elapsed time and lead_min stays a
@@ -471,8 +484,12 @@ pub(crate) fn start_heartbeat(
         // (lead_floor, receipt instant) for recovery lead estimates.
         let mut normative = initial_remaining_ttl_ms.is_some();
         let mut max_rtt_ms = create_rtt_ms;
+        let elapsed_after_receipt_ms =
+            ceil_ms(anchor.saturating_duration_since(create_received_at));
+        let remaining_at_start =
+            initial_remaining_ttl_ms.map(|r| r.saturating_sub(elapsed_after_receipt_ms));
         let mut lead_sample: Option<(u64, tokio::time::Instant)> =
-            initial_remaining_ttl_ms.map(|r| (lead_floor_ms(r, create_rtt_ms), anchor));
+            remaining_at_start.map(|r| (lead_floor_ms(r, create_rtt_ms), anchor));
         // Consecutive schema-valid successes whose next_delay was 0 (the
         // field-carrying create counts). Two in a row → the lease is
         // shorter than the retry-safety budget → stop.
@@ -481,11 +498,13 @@ pub(crate) fn start_heartbeat(
         // (None outside recovery): the progress guard stops the run when
         // the window fails to decrease between consecutive failures.
         let mut last_recovery_window: Option<i128> = None;
+        let mut last_recovery_failure_at: Option<tokio::time::Instant> = None;
+        let mut zero_window_retried = false;
 
         // The upcoming beat's *intended* instant; lead math measures elapsed
         // to this. Normative when the create response carried the field,
         // otherwise the immediate prime.
-        let mut next_beat = match initial_remaining_ttl_ms {
+        let mut next_beat = match remaining_at_start {
             Some(remaining) => {
                 let nd = remaining_next_delay_ms(
                     remaining,
@@ -542,26 +561,28 @@ pub(crate) fn start_heartbeat(
                 metadata: None,
             };
             let sent_at = tokio::time::Instant::now();
-            // In field mode only a schema-valid HTTP 200 counts as success
-            // (a different or malformed 2xx is ambiguous — surfaced as an
-            // error and recovered same-key below); the fallback keeps its
-            // any-2xx-as-applied semantics.
-            let result = if normative {
-                client
-                    .extend_reservation_strict(&reservation_id, &req)
-                    .await
-            } else {
-                client.extend_reservation(&reservation_id, &req).await
-            };
+            // In both scheduling modes only a schema-valid HTTP 200 counts
+            // as observed success. A different or malformed 2xx is
+            // ambiguous and must retain the same idempotency key.
+            let result = client
+                .extend_reservation_strict(&reservation_id, &req)
+                .await;
             match result {
                 Ok(resp) => {
+                    // Capture receipt immediately after the complete strict
+                    // response validation. Both RTT and the lead-floor anchor
+                    // must use this same instant; anchoring a little later
+                    // would credit local processing time back into the lease.
+                    let received_at = tokio::time::Instant::now();
                     // Per-attempt rtt (never an earlier attempt's timing —
                     // same-key replays recompute remaining_ttl_ms server
                     // side), rounded up: it is subtracted from the lease.
-                    let rtt_ms = ceil_ms(sent_at.elapsed());
+                    let rtt_ms = ceil_ms(received_at.duration_since(sent_at));
                     max_rtt_ms = max_rtt_ms.max(rtt_ms);
                     pending_key = None;
                     last_recovery_window = None;
+                    last_recovery_failure_at = None;
+                    zero_window_retried = false;
                     // The grant is the difference of successive server-frame
                     // expiries (signed — an expiry that moved backwards is a
                     // negative grant, classified lead-clamp and counted as
@@ -590,9 +611,8 @@ pub(crate) fn start_heartbeat(
                             // receipt. Expiry-difference heuristics are not
                             // used for scheduling in this mode.
                             normative = true;
-                            let received = tokio::time::Instant::now();
                             let floor = lead_floor_ms(remaining, rtt_ms);
-                            lead_sample = Some((floor, received));
+                            lead_sample = Some((floor, received_at));
                             let nd = remaining_next_delay_ms(
                                 remaining,
                                 rtt_ms,
@@ -619,10 +639,10 @@ pub(crate) fn start_heartbeat(
                                     );
                                     break;
                                 }
-                                next_beat = received;
+                                next_beat = received_at;
                             } else {
                                 zero_delay_streak = 0;
-                                next_beat = received + Duration::from_millis(nd);
+                                next_beat = received_at + Duration::from_millis(nd);
                             }
                         }
                         None => {
@@ -656,16 +676,6 @@ pub(crate) fn start_heartbeat(
                             next_beat = advance(next_beat, delay);
                         }
                     }
-                    // Any 2xx means the server applied the extension;
-                    // `expires_at_ms` (required by the spec response schema)
-                    // is authoritative regardless of the status string.
-                    if resp.status != ExtendStatus::Active {
-                        tracing::warn!(
-                            reservation_id = %reservation_id,
-                            status = ?resp.status,
-                            "heartbeat extend returned 2xx with unrecognized status; treating as applied (expires_at_ms is authoritative)"
-                        );
-                    }
                 }
                 Err(e) if is_permanent_extend_failure(&e) => {
                     tracing::warn!(
@@ -691,18 +701,30 @@ pub(crate) fn start_heartbeat(
                     }
                     // current_lead_estimate from the last schema-valid
                     // response — elapsed rounded up (it is consumed lease).
-                    let lead_now = lead_sample
-                        .map_or(0, |(floor, at)| floor.saturating_sub(ceil_ms(at.elapsed())));
+                    let failure_at = tokio::time::Instant::now();
+                    let lead_now = lead_sample.map_or(0, |(floor, at)| {
+                        floor.saturating_sub(ceil_ms(failure_at.duration_since(at)))
+                    });
                     // An unbounded attempt budget (None) admits no provably
                     // safe retry either: fold it into the negative window.
                     let window = recovery_window_ms(lead_now, request_timeout_ms, max_rtt_ms)
                         .unwrap_or(i128::MIN);
+                    if window == 0 && zero_window_retried {
+                        tracing::warn!(
+                            reservation_id = %reservation_id,
+                            error = %e,
+                            "heartbeat retry window is still zero after the one permitted immediate recovery retry; stopping heartbeat"
+                        );
+                        break;
+                    }
                     // Progress guard: the window must decrease between
                     // consecutive failures of the same recovery run (it
                     // decreases exactly when monotonic elapsed grows) — this
                     // also enforces "one immediate retry at window 0, then
                     // stop".
-                    if recovery_stalled(window, last_recovery_window) {
+                    let elapsed_advanced =
+                        last_recovery_failure_at.is_none_or(|previous| failure_at > previous);
+                    if recovery_stalled(window, last_recovery_window, elapsed_advanced) {
                         tracing::warn!(
                             reservation_id = %reservation_id,
                             error = %e,
@@ -718,6 +740,9 @@ pub(crate) fn start_heartbeat(
                             "no complete extend retry plus safety margin fits the remaining lease; stopping heartbeat (lease cannot be safely renewed)"
                         );
                         break;
+                    }
+                    if window == 0 {
+                        zero_window_retried = true;
                     }
                     let retry_delay_ms = if e.status() == Some(429) {
                         // 429: retry after exactly Retry-After (delta-seconds
@@ -743,6 +768,7 @@ pub(crate) fn start_heartbeat(
                     // applied-but-lost extension.
                     pending_key = Some(key);
                     last_recovery_window = Some(window);
+                    last_recovery_failure_at = Some(failure_at);
                     next_beat = tokio::time::Instant::now() + Duration::from_millis(retry_delay_ms);
                     tracing::warn!(
                         reservation_id = %reservation_id,
@@ -982,16 +1008,19 @@ mod tests {
     #[test]
     fn recovery_progress_guard() {
         // First failure of a run: no previous window → proceed.
-        assert!(!recovery_stalled(985, None));
-        assert!(!recovery_stalled(0, None));
+        assert!(!recovery_stalled(985, None, false));
+        assert!(!recovery_stalled(0, None, false));
         // Window decreased → progress → proceed.
-        assert!(!recovery_stalled(240, Some(985)));
-        assert!(!recovery_stalled(-3, Some(240)));
+        assert!(!recovery_stalled(240, Some(985), false));
+        assert!(!recovery_stalled(-3, Some(240), false));
+        // Raw monotonic elapsed advanced even if conservative millisecond
+        // rounding left the integer window unchanged.
+        assert!(!recovery_stalled(985, Some(985), true));
         // Window failed to decrease (coarse clock / zero-time loop) → stop.
-        assert!(recovery_stalled(985, Some(985)));
-        assert!(recovery_stalled(986, Some(985)));
+        assert!(recovery_stalled(985, Some(985), false));
+        assert!(recovery_stalled(986, Some(985), false));
         // Second failure at a zero window → stop (one immediate retry only).
-        assert!(recovery_stalled(0, Some(0)));
+        assert!(recovery_stalled(0, Some(0), false));
     }
 
     #[test]

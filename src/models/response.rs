@@ -8,6 +8,16 @@ use super::enums::{
 };
 use super::ids::{EventId, ReservationId};
 
+/// Reference to a signed CyclesEvidence envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct CyclesEvidenceRef {
+    /// SHA-256 content identifier of the evidence envelope.
+    pub evidence_id: String,
+    /// Absolute URL from which the evidence envelope can be fetched.
+    pub cycles_evidence_url: String,
+}
+
 /// Response from creating a reservation.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
@@ -49,6 +59,9 @@ pub struct ReservationCreateResponse {
     /// Current balances after the reservation.
     #[serde(default)]
     pub balances: Option<Vec<Balance>>,
+    /// Reference to the signed evidence emitted for this reserve operation.
+    #[serde(default)]
+    pub cycles_evidence: Option<CyclesEvidenceRef>,
 }
 
 /// Response from committing a reservation.
@@ -72,7 +85,7 @@ pub struct CommitResponse {
     /// **Client-side field** — never populated from a server commit
     /// response. `Some(event_id)` if and only if
     /// [`status`](Self::status) is
-    /// [`CommitStatus::RecoveredViaEvent`](super::enums::CommitStatus::RecoveredViaEvent).
+    /// [`CommitStatus::RecoveredViaEvent`].
     #[serde(default, skip_deserializing)]
     pub recovered_via_event: Option<EventId>,
 }

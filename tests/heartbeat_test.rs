@@ -702,15 +702,12 @@ async fn heartbeat_zero_grant_immediate_prime_holds_cadence() {
     guard.release("test done").await.unwrap();
 }
 
-/// An HTTP 200 whose status is unrecognized (forward-compat `Unknown`) still
-/// counts as **applied**: a 2xx means the server DID extend, and its
-/// `expires_at_ms` is authoritative. The heartbeat feeds it into the grant
-/// ledger (warning only) — pinned by the fresh key on beat 2 (a failure
-/// would have kept the key) and by beat 4 skipping exactly as in the
-/// all-ACTIVE cadence (a failure would have left the grant uncounted and
-/// beat 4 extending).
+/// An HTTP 200 whose status is unrecognized is ambiguous even on a fieldless
+/// server. The fallback may keep over-beating because it cannot prove a safe
+/// retry window, but it must retain the same idempotency key until an exact
+/// schema-valid response resolves the attempt.
 #[tokio::test]
-async fn heartbeat_2xx_unknown_status_counts_as_applied() {
+async fn heartbeat_fallback_unknown_status_retries_with_same_key() {
     let server = MockServer::start().await;
     let rsv_id = "rsv_hb_unknown";
     const TTL: u64 = 2_000;
@@ -734,23 +731,12 @@ async fn heartbeat_2xx_unknown_status_counts_as_applied() {
         "the immediate beat extends and receives the unknown-status 200"
     );
 
-    tokio::time::sleep(BEAT).await;
+    tokio::time::sleep(BEAT + MARGIN).await;
     let bodies = extend_bodies(&server, rsv_id, TTL).await;
     assert_eq!(bodies.len(), 2, "beat 2 extends (lead_min 1000 < 3000)");
-    assert_ne!(
-        bodies[0]["idempotency_key"], bodies[1]["idempotency_key"],
-        "the unknown-status 200 resolved the attempt: beat 2 must use a \
-         fresh key, not retry the old one"
-    );
-
-    // Beat 3 extends (lead_min 2000); beat 4 skips (lead_min 6000 − 3000 =
-    // 3000 = 1.5·grant) — proof the SUSPENDED response's grant entered the
-    // ledger.
-    tokio::time::sleep(BEAT + BEAT).await;
     assert_eq!(
-        extend_calls(&server, rsv_id, TTL).await,
-        3,
-        "a 2xx with unknown status must count as applied: beat 4 skips"
+        bodies[0]["idempotency_key"], bodies[1]["idempotency_key"],
+        "the unknown-status 200 is ambiguous: beat 2 must retry the same key"
     );
 
     guard.release("test done").await.unwrap();

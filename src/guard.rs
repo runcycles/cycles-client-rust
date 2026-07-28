@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::CyclesClient;
 use crate::error::Error;
-use crate::heartbeat::start_heartbeat;
+use crate::heartbeat::{start_heartbeat, CreateLeaseSample};
 use crate::models::common::{Action, Subject};
 use crate::models::enums::{CommitStatus, ErrorCode, EventStatus};
 use crate::models::request::{CommitRequest, EventCreateRequest, ReleaseRequest};
@@ -85,6 +85,7 @@ impl ReservationGuard {
         requested_ttl_ms: u64,
         remaining_ttl_ms: Option<u64>,
         create_rtt_ms: u64,
+        create_received_at: tokio::time::Instant,
         subject: Subject,
         action: Action,
     ) -> Self {
@@ -102,8 +103,11 @@ impl ReservationGuard {
             id.clone(),
             requested_ttl_ms,
             expires_at_ms,
-            remaining_ttl_ms,
-            create_rtt_ms,
+            CreateLeaseSample {
+                remaining_ttl_ms,
+                rtt_ms: create_rtt_ms,
+                received_at: create_received_at,
+            },
             cancel.clone(),
         );
 

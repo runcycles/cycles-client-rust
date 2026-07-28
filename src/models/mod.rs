@@ -21,7 +21,7 @@ pub use request::{
     ListReservationsParams, ReleaseRequest, ReservationCreateRequest,
 };
 pub use response::{
-    BalanceResponse, CommitResponse, DecisionResponse, DryRunResult, ErrorResponse,
-    EventCreateResponse, ExtendResponse, ReleaseResponse, ReservationCreateResponse,
+    BalanceResponse, CommitResponse, CyclesEvidenceRef, DecisionResponse, DryRunResult,
+    ErrorResponse, EventCreateResponse, ExtendResponse, ReleaseResponse, ReservationCreateResponse,
     ReservationDetail, ReservationListResponse, ReservationSummary,
 };
