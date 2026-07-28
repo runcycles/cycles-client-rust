@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::CyclesClient;
 use crate::error::Error;
-use crate::heartbeat::start_heartbeat;
+use crate::heartbeat::{start_heartbeat, CreateLeaseSample};
 use crate::models::common::{Action, Subject};
 use crate::models::enums::{CommitStatus, ErrorCode, EventStatus};
 use crate::models::request::{CommitRequest, EventCreateRequest, ReleaseRequest};
@@ -82,12 +82,34 @@ impl ReservationGuard {
         caps: Option<Caps>,
         expires_at_ms: Option<u64>,
         affected_scopes: Vec<String>,
-        ttl_ms: u64,
+        requested_ttl_ms: u64,
+        remaining_ttl_ms: Option<u64>,
+        create_rtt_ms: u64,
+        create_received_at: tokio::time::Instant,
         subject: Subject,
         action: Action,
     ) -> Self {
         let cancel = CancellationToken::new();
-        let heartbeat = start_heartbeat(client.clone(), id.clone(), ttl_ms, cancel.clone());
+        // The reserve response's expires_at_ms (server frame) is the base of
+        // the heartbeat's grant ledger. When the response carries
+        // remaining_ttl_ms (spec PR #148) the heartbeat schedules from it
+        // normatively, with create_rtt_ms bounding the sample's staleness;
+        // otherwise the first extend fires immediately — a tenant policy may
+        // have silently capped the lease far below the requested TTL, and no
+        // bounded delay provably beats an arbitrarily small grant; see
+        // src/heartbeat.rs module docs.
+        let heartbeat = start_heartbeat(
+            client.clone(),
+            id.clone(),
+            requested_ttl_ms,
+            expires_at_ms,
+            CreateLeaseSample {
+                remaining_ttl_ms,
+                rtt_ms: create_rtt_ms,
+                received_at: create_received_at,
+            },
+            cancel.clone(),
+        );
 
         Self {
             client,

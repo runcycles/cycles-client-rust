@@ -357,3 +357,43 @@ fn dry_run_result_from_json() {
     assert_eq!(result.decision, Decision::AllowWithCaps);
     assert_eq!(result.caps.unwrap().max_tokens, Some(200));
 }
+
+#[test]
+fn remaining_ttl_ms_parses_on_create_and_extend_and_defaults_to_none() {
+    // Spec PR #148: remaining reservation lifetime at response evaluation,
+    // same clock snapshot as expires_at_ms. Optional for back-compat with
+    // servers that predate the field.
+    let create: ReservationCreateResponse = serde_json::from_value(json!({
+        "decision": "ALLOW",
+        "reservation_id": "rsv_rt",
+        "affected_scopes": ["tenant:acme"],
+        "expires_at_ms": 1700000060000_u64,
+        "remaining_ttl_ms": 60000
+    }))
+    .unwrap();
+    assert_eq!(create.remaining_ttl_ms, Some(60_000));
+
+    let legacy_create: ReservationCreateResponse = serde_json::from_value(json!({
+        "decision": "ALLOW",
+        "reservation_id": "rsv_rt",
+        "affected_scopes": ["tenant:acme"],
+        "expires_at_ms": 1700000060000_u64
+    }))
+    .unwrap();
+    assert_eq!(legacy_create.remaining_ttl_ms, None);
+
+    let extend: ExtendResponse = serde_json::from_value(json!({
+        "status": "ACTIVE",
+        "expires_at_ms": 1700000120000_u64,
+        "remaining_ttl_ms": 60000
+    }))
+    .unwrap();
+    assert_eq!(extend.remaining_ttl_ms, Some(60_000));
+
+    let legacy_extend: ExtendResponse = serde_json::from_value(json!({
+        "status": "ACTIVE",
+        "expires_at_ms": 1700000120000_u64
+    }))
+    .unwrap();
+    assert_eq!(legacy_extend.remaining_ttl_ms, None);
+}

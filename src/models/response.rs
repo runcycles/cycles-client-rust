@@ -8,6 +8,16 @@ use super::enums::{
 };
 use super::ids::{EventId, ReservationId};
 
+/// Reference to a signed CyclesEvidence envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct CyclesEvidenceRef {
+    /// SHA-256 content identifier of the evidence envelope.
+    pub evidence_id: String,
+    /// Absolute URL from which the evidence envelope can be fetched.
+    pub cycles_evidence_url: String,
+}
+
 /// Response from creating a reservation.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
@@ -23,6 +33,14 @@ pub struct ReservationCreateResponse {
     /// When the reservation expires (Unix ms).
     #[serde(default)]
     pub expires_at_ms: Option<u64>,
+    /// Remaining reservation lifetime in milliseconds at response
+    /// evaluation, from the same clock snapshot as `expires_at_ms`
+    /// (spec PR #148). Present on successful live-reservation responses;
+    /// absent on dry-run/DENY and on older servers. When present, the
+    /// heartbeat schedules from it verbatim (normative); when absent, the
+    /// grant-ledger heuristic applies.
+    #[serde(default)]
+    pub remaining_ttl_ms: Option<u64>,
     /// The fully qualified scope path.
     #[serde(default)]
     pub scope_path: Option<String>,
@@ -41,6 +59,9 @@ pub struct ReservationCreateResponse {
     /// Current balances after the reservation.
     #[serde(default)]
     pub balances: Option<Vec<Balance>>,
+    /// Reference to the signed evidence emitted for this reserve operation.
+    #[serde(default)]
+    pub cycles_evidence: Option<CyclesEvidenceRef>,
 }
 
 /// Response from committing a reservation.
@@ -64,7 +85,7 @@ pub struct CommitResponse {
     /// **Client-side field** — never populated from a server commit
     /// response. `Some(event_id)` if and only if
     /// [`status`](Self::status) is
-    /// [`CommitStatus::RecoveredViaEvent`](super::enums::CommitStatus::RecoveredViaEvent).
+    /// [`CommitStatus::RecoveredViaEvent`].
     #[serde(default, skip_deserializing)]
     pub recovered_via_event: Option<EventId>,
 }
@@ -99,6 +120,14 @@ pub struct ExtendResponse {
     pub status: ExtendStatus,
     /// The new expiry time (Unix ms).
     pub expires_at_ms: u64,
+    /// Remaining reservation lifetime in milliseconds at response
+    /// evaluation, from the same clock snapshot as `expires_at_ms`
+    /// (spec PR #148). Present on successful responses from servers that
+    /// implement it. When present, the heartbeat schedules from it
+    /// verbatim (normative); when absent, the grant-ledger heuristic
+    /// applies.
+    #[serde(default)]
+    pub remaining_ttl_ms: Option<u64>,
     /// Current balances.
     #[serde(default)]
     pub balances: Option<Vec<Balance>>,

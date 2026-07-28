@@ -6,6 +6,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde_json::{Map as JsonMap, Value};
 
 use crate::config::{CyclesClientBuilder, CyclesConfig};
 use crate::constants::{
@@ -35,6 +36,221 @@ use crate::validation;
 /// reserves in a different unit (e.g. `TOKENS`). The raw 404 message then
 /// reads like a plain scope-lookup miss, which is misleading. See issue #8.
 const BUDGET_NOT_FOUND_MARKER: &str = "Budget not found for provided scope";
+const CREATE_RESPONSE_FIELDS: &[&str] = &[
+    "decision",
+    "reservation_id",
+    "affected_scopes",
+    "expires_at_ms",
+    "remaining_ttl_ms",
+    "scope_path",
+    "reserved",
+    "caps",
+    "reason_code",
+    "retry_after_ms",
+    "balances",
+    "cycles_evidence",
+];
+const EXTEND_RESPONSE_FIELDS: &[&str] =
+    &["status", "expires_at_ms", "remaining_ttl_ms", "balances"];
+const AMOUNT_FIELDS: &[&str] = &["unit", "amount"];
+const CAPS_FIELDS: &[&str] = &[
+    "max_tokens",
+    "max_steps_remaining",
+    "tool_allowlist",
+    "tool_denylist",
+    "cooldown_ms",
+];
+const BALANCE_FIELDS: &[&str] = &[
+    "scope",
+    "scope_path",
+    "remaining",
+    "reserved",
+    "spent",
+    "allocated",
+    "debt",
+    "overdraft_limit",
+    "is_over_limit",
+];
+const EVIDENCE_FIELDS: &[&str] = &["evidence_id", "cycles_evidence_url"];
+
+fn has_exact_or_optional_fields(object: &JsonMap<String, Value>, allowed: &[&str]) -> bool {
+    object.keys().all(|key| allowed.contains(&key.as_str()))
+}
+
+fn is_known_unit(value: &Value) -> bool {
+    matches!(
+        value.as_str(),
+        Some("USD_MICROCENTS" | "TOKENS" | "CREDITS" | "RISK_POINTS")
+    )
+}
+
+fn is_nonnegative_int64(value: &Value) -> bool {
+    value
+        .as_u64()
+        .is_some_and(|number| number <= i64::MAX as u64)
+}
+
+fn is_string_array(value: &Value, max_chars: Option<usize>) -> bool {
+    value.as_array().is_some_and(|items| {
+        items.iter().all(|item| {
+            item.as_str()
+                .is_some_and(|text| max_chars.is_none_or(|max| text.chars().count() <= max))
+        })
+    })
+}
+
+fn is_amount(value: &Value, signed: bool) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    has_exact_or_optional_fields(object, AMOUNT_FIELDS)
+        && object.len() == AMOUNT_FIELDS.len()
+        && object.get("unit").is_some_and(is_known_unit)
+        && object
+            .get("amount")
+            .and_then(Value::as_i64)
+            .is_some_and(|amount| signed || amount >= 0)
+}
+
+fn is_caps(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if !has_exact_or_optional_fields(object, CAPS_FIELDS) {
+        return false;
+    }
+    ["max_tokens", "max_steps_remaining", "cooldown_ms"]
+        .into_iter()
+        .all(|key| {
+            object
+                .get(key)
+                .is_none_or(|item| item.as_i64().is_some_and(|number| number >= 0))
+        })
+        && ["tool_allowlist", "tool_denylist"].into_iter().all(|key| {
+            object
+                .get(key)
+                .is_none_or(|item| is_string_array(item, Some(256)))
+        })
+}
+
+fn is_balance(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if !has_exact_or_optional_fields(object, BALANCE_FIELDS)
+        || !object.get("scope").is_some_and(Value::is_string)
+        || !object.get("scope_path").is_some_and(Value::is_string)
+        || !object
+            .get("remaining")
+            .is_some_and(|amount| is_amount(amount, true))
+    {
+        return false;
+    }
+    ["reserved", "spent", "allocated", "debt", "overdraft_limit"]
+        .into_iter()
+        .all(|key| {
+            object
+                .get(key)
+                .is_none_or(|amount| is_amount(amount, false))
+        })
+        && object.get("is_over_limit").is_none_or(Value::is_boolean)
+}
+
+fn is_balances(value: &Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|balances| balances.iter().all(is_balance))
+}
+
+fn is_evidence_ref(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if !has_exact_or_optional_fields(object, EVIDENCE_FIELDS)
+        || object.len() != EVIDENCE_FIELDS.len()
+    {
+        return false;
+    }
+    let valid_id = object
+        .get("evidence_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| {
+            id.len() == 64
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    let valid_url = object
+        .get("cycles_evidence_url")
+        .and_then(Value::as_str)
+        .is_some_and(|url| reqwest::Url::parse(url).is_ok());
+    valid_id && valid_url
+}
+
+fn is_schema_valid_create_body(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if !has_exact_or_optional_fields(object, CREATE_RESPONSE_FIELDS)
+        || !matches!(
+            object.get("decision").and_then(Value::as_str),
+            Some("ALLOW" | "ALLOW_WITH_CAPS" | "DENY")
+        )
+        || !object
+            .get("affected_scopes")
+            .is_some_and(|value| is_string_array(value, None))
+    {
+        return false;
+    }
+    object.get("reservation_id").is_none_or(Value::is_string)
+        && object.get("expires_at_ms").is_none_or(is_nonnegative_int64)
+        && object
+            .get("remaining_ttl_ms")
+            .is_none_or(is_nonnegative_int64)
+        && object.get("scope_path").is_none_or(Value::is_string)
+        && object
+            .get("reserved")
+            .is_none_or(|value| is_amount(value, false))
+        && object.get("caps").is_none_or(is_caps)
+        && object.get("reason_code").is_none_or(|value| {
+            value
+                .as_str()
+                .is_some_and(|reason| reason.chars().count() <= 128)
+        })
+        && object
+            .get("retry_after_ms")
+            .is_none_or(|value| value.as_u64().is_some())
+        && object.get("balances").is_none_or(is_balances)
+        && object.get("cycles_evidence").is_none_or(is_evidence_ref)
+}
+
+fn is_schema_valid_extend_body(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    has_exact_or_optional_fields(object, EXTEND_RESPONSE_FIELDS)
+        && object.get("status").and_then(Value::as_str) == Some("ACTIVE")
+        && object
+            .get("expires_at_ms")
+            .is_some_and(is_nonnegative_int64)
+        && object
+            .get("remaining_ttl_ms")
+            .is_none_or(is_nonnegative_int64)
+        && object.get("balances").is_none_or(is_balances)
+}
+
+fn parse_retry_after_delta(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = value.parse::<u64>().ok()?;
+    let milliseconds = seconds.checked_mul(1_000)?;
+    if milliseconds > i64::MAX as u64 {
+        return None;
+    }
+    Some(Duration::from_millis(milliseconds))
+}
 
 /// If `err` is a 404 `NOT_FOUND` whose message matches the server's
 /// "Budget not found for provided scope" pattern, enrich it with the unit that
@@ -139,7 +355,7 @@ impl CyclesClient {
         let http = http_client.unwrap_or_else(|| {
             reqwest::Client::builder()
                 .connect_timeout(config.connect_timeout)
-                .timeout(config.connect_timeout + config.read_timeout)
+                .timeout(config.connect_timeout.saturating_add(config.read_timeout))
                 .build()
                 .expect("failed to build HTTP client")
         });
@@ -152,6 +368,13 @@ impl CyclesClient {
     /// Access the client configuration.
     pub fn config(&self) -> &CyclesConfig {
         &self.inner.config
+    }
+
+    fn attempt_timeout(&self) -> Duration {
+        self.inner
+            .config
+            .connect_timeout
+            .saturating_add(self.inner.config.read_timeout)
     }
 
     // ─── High-Level API ──────────────────────────────────────────────
@@ -169,7 +392,15 @@ impl CyclesClient {
         validation::validate_grace_period_ms(req.grace_period_ms)?;
         validation::validate_non_negative(req.estimate.amount, "estimate.amount")?;
 
-        let resp = self.create_reservation(&req).await?;
+        // Round-trip time of the reserve call: when the response carries
+        // remaining_ttl_ms (spec PR #148), the heartbeat subtracts this from
+        // it to get a floor on the lease actually left at receipt. Rounded
+        // up — consumed lease must never be under-counted.
+        let (response, create_rtt_ms, create_received_at) = self
+            .create_reservation_with_metadata_strict(&req)
+            .await
+            .map_err(|error| enrich_budget_not_found(error, req.estimate.unit))?;
+        let resp = response.into_inner();
 
         if resp.decision.is_denied() {
             return Err(Error::BudgetExceeded {
@@ -229,6 +460,9 @@ impl CyclesClient {
             resp.expires_at_ms,
             resp.affected_scopes.clone(),
             req.ttl_ms,
+            resp.remaining_ttl_ms,
+            create_rtt_ms,
+            create_received_at,
             req.subject.clone(),
             req.action.clone(),
         ))
@@ -241,8 +475,9 @@ impl CyclesClient {
         &self,
         req: &ReservationCreateRequest,
     ) -> Result<ReservationCreateResponse, Error> {
-        self.post_json(RESERVATIONS_PATH, req, Some(req.idempotency_key.as_str()))
+        self.create_reservation_with_metadata_strict(req)
             .await
+            .map(|(response, _rtt_ms, _received_at)| response.into_inner())
             .map_err(|e| enrich_budget_not_found(e, req.estimate.unit))
     }
 
@@ -251,9 +486,91 @@ impl CyclesClient {
         &self,
         req: &ReservationCreateRequest,
     ) -> Result<ApiResponse<ReservationCreateResponse>, Error> {
-        self.post_json_with_metadata(RESERVATIONS_PATH, req, Some(req.idempotency_key.as_str()))
+        self.create_reservation_with_metadata_strict(req)
             .await
+            .map(|(response, _rtt_ms, _received_at)| response)
             .map_err(|e| enrich_budget_not_found(e, req.estimate.unit))
+    }
+
+    async fn create_reservation_with_metadata_strict(
+        &self,
+        req: &ReservationCreateRequest,
+    ) -> Result<
+        (
+            ApiResponse<ReservationCreateResponse>,
+            u64,
+            tokio::time::Instant,
+        ),
+        Error,
+    > {
+        let mut final_error = None;
+        for attempt in 0..2 {
+            let sent_at = tokio::time::Instant::now();
+            match self.create_reservation_attempt(req).await {
+                Ok(response) => {
+                    let received_at = tokio::time::Instant::now();
+                    return Ok((
+                        response,
+                        crate::heartbeat::ceil_ms(received_at.duration_since(sent_at)),
+                        received_at,
+                    ));
+                }
+                Err(error) => {
+                    let recoverable =
+                        matches!(&error, Error::Transport(_) | Error::Deserialization(_))
+                            || matches!(&error, Error::Api { status, .. } if *status >= 500);
+                    if attempt == 0 && recoverable {
+                        final_error = Some(error);
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Err(final_error.unwrap_or_else(|| {
+            Error::Validation("reservation create recovery exhausted".to_string())
+        }))
+    }
+
+    async fn create_reservation_attempt(
+        &self,
+        req: &ReservationCreateRequest,
+    ) -> Result<ApiResponse<ReservationCreateResponse>, Error> {
+        let url = format!("{}{RESERVATIONS_PATH}", self.inner.config.base_url);
+        let resp = self
+            .inner
+            .http
+            .post(&url)
+            .timeout(self.attempt_timeout())
+            .header(API_KEY_HEADER, &self.inner.config.api_key)
+            .header(IDEMPOTENCY_KEY_HEADER, req.idempotency_key.as_str())
+            .json(req)
+            .send()
+            .await?;
+        let response_headers = resp.headers().clone();
+        let status = resp.status().as_u16();
+        if status == 200 {
+            let value: Value = resp.json().await.map_err(|error| {
+                Error::Deserialization(serde::de::Error::custom(format!(
+                    "ambiguous create response: HTTP 200 body is not valid JSON: {error}"
+                )))
+            })?;
+            if !is_schema_valid_create_body(&value) {
+                return Err(Error::Deserialization(serde::de::Error::custom(
+                    "ambiguous create response: HTTP 200 body is not a schema-valid ReservationCreateResponse",
+                )));
+            }
+            let data = serde_json::from_value(value).map_err(Error::Deserialization)?;
+            Ok(ApiResponse::from_response(data, &response_headers))
+        } else if (200..300).contains(&status) {
+            Err(Error::Deserialization(serde::de::Error::custom(format!(
+                "ambiguous create response: HTTP {status} is a non-200 2xx"
+            ))))
+        } else {
+            Err(self
+                .parse_error_response(status, resp, &response_headers)
+                .await)
+        }
     }
 
     /// Commit actual spend against a reservation.
@@ -287,6 +604,60 @@ impl CyclesClient {
         let path = format!("{RESERVATIONS_PATH}/{}/extend", id.as_str());
         self.post_json(&path, req, Some(req.idempotency_key.as_str()))
             .await
+    }
+
+    /// Extend with the spec's strict field-mode success predicate: only a
+    /// **schema-valid HTTP 200** `ReservationExtendResponse` counts as an
+    /// observed success. A different 2xx status, or a 200 whose body does
+    /// not parse against the schema, is *ambiguous* — surfaced as
+    /// [`Error::Deserialization`] so the heartbeat's primary-path recovery
+    /// treats it as a transient failure and retries with the same
+    /// idempotency key (see the HEARTBEAT GUIDANCE in
+    /// `cycles-protocol-v0.yaml`). Non-2xx responses parse into the usual
+    /// typed errors (including 429 `Retry-After`).
+    pub(crate) async fn extend_reservation_strict(
+        &self,
+        id: &ReservationId,
+        req: &ExtendRequest,
+    ) -> Result<ExtendResponse, Error> {
+        let url = format!(
+            "{}{RESERVATIONS_PATH}/{}/extend",
+            self.inner.config.base_url,
+            id.as_str()
+        );
+        let resp = self
+            .inner
+            .http
+            .post(&url)
+            .timeout(self.attempt_timeout())
+            .header(API_KEY_HEADER, &self.inner.config.api_key)
+            .header(IDEMPOTENCY_KEY_HEADER, req.idempotency_key.as_str())
+            .json(req)
+            .send()
+            .await?;
+        let response_headers = resp.headers().clone();
+        let status = resp.status().as_u16();
+        if status == 200 {
+            let value: Value = resp.json().await.map_err(|error| {
+                Error::Deserialization(serde::de::Error::custom(format!(
+                    "ambiguous extend response: HTTP 200 body is not valid JSON: {error}"
+                )))
+            })?;
+            if !is_schema_valid_extend_body(&value) {
+                return Err(Error::Deserialization(serde::de::Error::custom(
+                    "ambiguous extend response: HTTP 200 body is not a schema-valid ReservationExtendResponse",
+                )));
+            }
+            serde_json::from_value(value).map_err(Error::Deserialization)
+        } else if (200..300).contains(&status) {
+            Err(Error::Deserialization(serde::de::Error::custom(format!(
+                "ambiguous extend response: HTTP {status} is a non-200 2xx and cannot be used to schedule from"
+            ))))
+        } else {
+            Err(self
+                .parse_error_response(status, resp, &response_headers)
+                .await)
+        }
     }
 
     /// Preflight budget decision check (no reservation created).
@@ -368,6 +739,7 @@ impl CyclesClient {
             .inner
             .http
             .post(&url)
+            .timeout(self.attempt_timeout())
             .headers(headers)
             .json(body)
             .send()
@@ -400,6 +772,7 @@ impl CyclesClient {
             .inner
             .http
             .get(&url)
+            .timeout(self.attempt_timeout())
             .header(API_KEY_HEADER, &self.inner.config.api_key);
 
         if let Some(q) = query {
@@ -438,8 +811,7 @@ impl CyclesClient {
         let retry_after = headers
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(Duration::from_secs);
+            .and_then(parse_retry_after_delta);
 
         let body: Option<ErrorResponse> = resp.json().await.ok();
 
@@ -498,6 +870,107 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn strict_lease_response_validators_cover_full_nested_schema() {
+        let balance = json!({
+            "scope": "tenant:acme",
+            "scope_path": "tenant:acme",
+            "remaining": {"unit": "TOKENS", "amount": -1},
+            "reserved": {"unit": "TOKENS", "amount": 1},
+            "is_over_limit": false
+        });
+        let create = json!({
+            "decision": "ALLOW",
+            "reservation_id": "rsv_strict",
+            "affected_scopes": ["tenant:acme"],
+            "remaining_ttl_ms": 0,
+            "balances": [balance.clone()],
+            "cycles_evidence": {
+                "evidence_id": "a".repeat(64),
+                "cycles_evidence_url": "https://cycles.example/v1/evidence/id"
+            }
+        });
+        assert!(is_schema_valid_create_body(&create));
+
+        let extend = json!({
+            "status": "ACTIVE",
+            "expires_at_ms": 1,
+            "remaining_ttl_ms": 0,
+            "balances": [balance]
+        });
+        assert!(is_schema_valid_extend_body(&extend));
+
+        let mut extra = extend.clone();
+        extra["unexpected"] = json!(true);
+        assert!(!is_schema_valid_extend_body(&extra));
+
+        let mut unknown_status = extend.clone();
+        unknown_status["status"] = json!("FUTURE");
+        assert!(!is_schema_valid_extend_body(&unknown_status));
+
+        let mut negative = extend.clone();
+        negative["remaining_ttl_ms"] = json!(-1);
+        assert!(!is_schema_valid_extend_body(&negative));
+
+        let mut overflow = extend.clone();
+        overflow["remaining_ttl_ms"] = json!(i64::MAX as u64 + 1);
+        assert!(!is_schema_valid_extend_body(&overflow));
+
+        let mut malformed_balance = extend;
+        malformed_balance["balances"] = json!([{"scope": "missing-required-fields"}]);
+        assert!(!is_schema_valid_extend_body(&malformed_balance));
+    }
+
+    #[test]
+    fn strict_create_validator_rejects_invalid_optional_fields() {
+        let valid = json!({
+            "decision": "DENY",
+            "affected_scopes": [],
+            "reason_code": "x".repeat(128)
+        });
+        assert!(is_schema_valid_create_body(&valid));
+
+        for invalid in [
+            json!({"decision": "FUTURE", "affected_scopes": []}),
+            json!({"decision": "DENY", "affected_scopes": [], "caps": null}),
+            json!({"decision": "DENY", "affected_scopes": [], "expires_at_ms": -1}),
+            json!({"decision": "DENY", "affected_scopes": [], "reason_code": "x".repeat(129)}),
+            json!({"decision": "DENY", "affected_scopes": [], "reserved": {"unit": "UNKNOWN", "amount": 1}}),
+            json!({"decision": "DENY", "affected_scopes": [], "cycles_evidence": {
+                "evidence_id": "A".repeat(64),
+                "cycles_evidence_url": "relative"
+            }}),
+        ] {
+            assert!(!is_schema_valid_create_body(&invalid), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn retry_after_accepts_only_ascii_delta_seconds() {
+        assert_eq!(parse_retry_after_delta(" 3 "), Some(Duration::from_secs(3)));
+        let max_seconds = i64::MAX as u64 / 1_000;
+        assert_eq!(
+            parse_retry_after_delta(&max_seconds.to_string()),
+            Some(Duration::from_millis(max_seconds * 1_000))
+        );
+        assert_eq!(
+            parse_retry_after_delta(&(max_seconds + 1).to_string()),
+            None
+        );
+        for value in [
+            "",
+            "-1",
+            "+1",
+            "1e2",
+            "1.5",
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+            "9223372036854775808",
+        ] {
+            assert_eq!(parse_retry_after_delta(value), None, "{value}");
+        }
+    }
 
     #[test]
     fn enrich_budget_not_found_adds_unit_hint() {

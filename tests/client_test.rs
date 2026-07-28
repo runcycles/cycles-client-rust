@@ -3,13 +3,30 @@
 use runcycles::models::*;
 use runcycles::{CyclesClient, Error};
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use wiremock::matchers::{header, method, path, path_regex, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 async fn setup() -> (MockServer, CyclesClient) {
     let server = MockServer::start().await;
     let client = CyclesClient::builder("test-api-key", server.uri()).build();
     (server, client)
+}
+
+struct AmbiguousThenValidCreate {
+    calls: AtomicUsize,
+}
+
+impl Respond for AmbiguousThenValidCreate {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        ResponseTemplate::new(if call == 0 { 202 } else { 200 }).set_body_json(json!({
+            "decision": "ALLOW",
+            "reservation_id": "rsv_recovered",
+            "affected_scopes": ["tenant:acme"]
+        }))
+    }
 }
 
 // ─── create_reservation ───────────────────────────────────────────
@@ -28,11 +45,7 @@ async fn create_reservation_success() {
             "affected_scopes": ["tenant:acme"],
             "expires_at_ms": 1700000000000_u64,
             "scope_path": "tenant:acme",
-            "reserved": {"unit": "USD_MICROCENTS", "amount": 5000},
-            "caps": null,
-            "reason_code": null,
-            "retry_after_ms": null,
-            "balances": null
+            "reserved": {"unit": "USD_MICROCENTS", "amount": 5000}
         })))
         .expect(1)
         .mount(&server)
@@ -54,6 +67,146 @@ async fn create_reservation_success() {
 }
 
 #[tokio::test]
+async fn create_reservation_recovers_once_with_the_same_body_and_key() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations"))
+        .and(header("X-Idempotency-Key", "fixed-create-key"))
+        .respond_with(AmbiguousThenValidCreate {
+            calls: AtomicUsize::new(0),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let req = ReservationCreateRequest::builder()
+        .idempotency_key(IdempotencyKey::new("fixed-create-key"))
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::usd_microcents(5000))
+        .build();
+
+    let response = client.create_reservation(&req).await.unwrap();
+    assert_eq!(
+        response.reservation_id.as_ref().map(ReservationId::as_str),
+        Some("rsv_recovered")
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body, requests[1].body);
+}
+
+#[tokio::test]
+async fn create_reservation_retries_malformed_200_once_then_surfaces() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "decision": "ALLOW",
+            "reservation_id": "rsv_invalid",
+            "affected_scopes": ["tenant:acme"],
+            "unexpected": true
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let req = ReservationCreateRequest::builder()
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::usd_microcents(5000))
+        .build();
+
+    let error = client.create_reservation(&req).await.unwrap_err();
+    assert!(matches!(error, Error::Deserialization(_)));
+}
+
+#[tokio::test]
+async fn create_reservation_retries_invalid_json_once_then_surfaces() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let req = ReservationCreateRequest::builder()
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::usd_microcents(5000))
+        .build();
+
+    let error = client.create_reservation(&req).await.unwrap_err();
+    assert!(matches!(error, Error::Deserialization(_)));
+}
+
+#[tokio::test]
+async fn generic_post_rejects_an_invalid_api_key_header() {
+    let client = CyclesClient::builder("bad\nkey", "http://localhost").build();
+    let error = client
+        .commit_reservation(
+            &ReservationId::new("rsv_1"),
+            &CommitRequest::builder()
+                .actual(Amount::usd_microcents(1))
+                .build(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::Config(message) if message.contains("invalid API key")));
+}
+
+#[tokio::test]
+async fn custom_http_client_cannot_remove_complete_attempt_timeout() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(json!({
+                    "decision": "ALLOW",
+                    "reservation_id": "rsv_too_late",
+                    "affected_scopes": ["tenant:acme"]
+                })),
+        )
+        .mount(&server)
+        .await;
+    let custom = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let client = CyclesClient::builder("key", server.uri())
+        .connect_timeout(Duration::from_millis(10))
+        .read_timeout(Duration::from_millis(10))
+        .http_client(custom)
+        .build();
+    let req = ReservationCreateRequest::builder()
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::usd_microcents(5000))
+        .build();
+
+    let started = Instant::now();
+    let error = client.create_reservation(&req).await.unwrap_err();
+    assert!(matches!(error, Error::Transport(_)));
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[tokio::test]
 async fn reserve_unknown_decision_without_reservation_id_errors_instead_of_panicking() {
     // Regression (fleet audit 2026-07-04, issue #56 item 1): a FUTURE
     // decision value deserializes to Decision::Unknown via #[serde(other)],
@@ -68,7 +221,7 @@ async fn reserve_unknown_decision_without_reservation_id_errors_instead_of_panic
             "decision": "ALLOW_BUT_QUEUED",
             "affected_scopes": ["tenant:acme"]
         })))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
 
@@ -86,10 +239,10 @@ async fn reserve_unknown_decision_without_reservation_id_errors_instead_of_panic
         .await
         .expect_err("must error, not panic");
     match err {
-        Error::Validation(msg) => {
-            assert!(msg.contains("unrecognized decision"), "got: {msg}");
+        Error::Deserialization(source) => {
+            assert!(source.to_string().contains("schema-valid"), "got: {source}");
         }
-        other => panic!("expected Error::Validation, got {other:?}"),
+        other => panic!("expected Error::Deserialization, got {other:?}"),
     }
 }
 
@@ -108,7 +261,7 @@ async fn reserve_unknown_decision_with_reservation_id_still_refuses_guard() {
             "reservation_id": "rsv_queued_1",
             "affected_scopes": ["tenant:acme"]
         })))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
 
@@ -126,10 +279,10 @@ async fn reserve_unknown_decision_with_reservation_id_still_refuses_guard() {
         .await
         .expect_err("unknown decision must not yield a guard");
     match err {
-        Error::Validation(msg) => {
-            assert!(msg.contains("unrecognized decision"), "got: {msg}");
+        Error::Deserialization(source) => {
+            assert!(source.to_string().contains("schema-valid"), "got: {source}");
         }
-        other => panic!("expected Error::Validation, got {other:?}"),
+        other => panic!("expected Error::Deserialization, got {other:?}"),
     }
 }
 
@@ -859,6 +1012,38 @@ async fn reserve_returns_error_on_deny() {
         .unwrap_err();
 
     assert!(err.is_budget_exceeded());
+}
+
+#[tokio::test]
+async fn reserve_deny_without_reason_uses_budget_exceeded_default() {
+    let (server, client) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "decision": "DENY",
+            "affected_scopes": ["tenant:acme"]
+        })))
+        .mount(&server)
+        .await;
+
+    let error = client
+        .reserve(
+            ReservationCreateRequest::builder()
+                .subject(Subject {
+                    tenant: Some("acme".into()),
+                    ..Default::default()
+                })
+                .action(Action::new("llm.completion", "gpt-4o"))
+                .estimate(Amount::usd_microcents(1))
+                .build(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::BudgetExceeded { message, .. } if message == "budget exceeded"
+    ));
 }
 
 #[tokio::test]

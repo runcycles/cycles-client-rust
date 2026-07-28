@@ -23,16 +23,31 @@ pub fn make_reserve_request() -> ReservationCreateRequest {
         .build()
 }
 
+/// HTTP `Date` header consistent with the reserve mocks' `expires_at_ms`
+/// (1_700_000_000 s = Tue, 14 Nov 2023 22:13:20 GMT). Since heartbeat v2.3
+/// the client derives no scheduling from `Date` (the first extend is
+/// immediate) — the header is kept purely as realistic response furniture.
+pub const HTTP_DATE: &str = "Tue, 14 Nov 2023 22:13:20 GMT";
+
 /// Mount `POST /v1/reservations` responding `ALLOW` with the given id.
+/// The heartbeat's first extend fires immediately (v2.3), so suites using
+/// this must also mount the extend endpoint (`mount_extend`); the mocked
+/// grant equals the default 60 s requested TTL, so after that first beat
+/// the cadence settles at min(60000/2, 30 s) = 30 s — quiet for the
+/// duration of any unrelated test.
 pub async fn mount_reserve_allow(server: &MockServer, reservation_id: &str) {
     Mock::given(method("POST"))
         .and(path("/v1/reservations"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "decision": "ALLOW",
-            "reservation_id": reservation_id,
-            "affected_scopes": ["tenant:acme"],
-            "expires_at_ms": 1700000060000_u64
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("date", HTTP_DATE)
+                .set_body_json(json!({
+                    "decision": "ALLOW",
+                    "reservation_id": reservation_id,
+                    "affected_scopes": ["tenant:acme"],
+                    "expires_at_ms": 1700000060000_u64
+                })),
+        )
         .mount(server)
         .await;
 }
@@ -56,13 +71,17 @@ pub async fn setup_with_reservation(server: &MockServer) -> CyclesClient {
 
     Mock::given(method("POST"))
         .and(path("/v1/reservations"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "decision": "ALLOW_WITH_CAPS",
-            "reservation_id": "rsv_test",
-            "affected_scopes": ["tenant:acme", "app:my-app"],
-            "expires_at_ms": 1700000060000_u64,
-            "caps": {"max_tokens": 500, "max_steps_remaining": 10, "cooldown_ms": 1000}
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("date", HTTP_DATE)
+                .set_body_json(json!({
+                    "decision": "ALLOW_WITH_CAPS",
+                    "reservation_id": "rsv_test",
+                    "affected_scopes": ["tenant:acme", "app:my-app"],
+                    "expires_at_ms": 1700000060000_u64,
+                    "caps": {"max_tokens": 500, "max_steps_remaining": 10, "cooldown_ms": 1000}
+                })),
+        )
         .mount(server)
         .await;
 
