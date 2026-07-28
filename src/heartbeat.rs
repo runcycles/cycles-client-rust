@@ -1,12 +1,53 @@
 //! Background TTL extension (heartbeat) for active reservations.
 //!
-//! # Grant-ledger design (v2.3)
-//!
 //! The protocol's `extend_by_ms` is relative to the reservation's **current
 //! `expires_at_ms`**, not to request time (`cycles-protocol-v0.yaml`), so the
 //! heartbeat must decide per beat whether an extension is actually needed —
 //! blindly extending every beat drifts the expiry outward, and fixed
 //! skip-every-other-beat cadences lapse for small TTLs or clamped grants.
+//!
+//! # Normative scheduling: `remaining_ttl_ms` (spec PR #148, round 5)
+//!
+//! Spec review round 5 proved that no client-side heuristic can decide, from
+//! `(grant, elapsed)` samples alone, whether a shortfall grant is a *real*
+//! per-extend lease or a maximum-LEAD clamp echoing elapsed time (sticky
+//! counterexample: ttl 24 s with real +10 s grants → held cadence 12 s →
+//! post-skip ratio 10/12 stays inside any plausible detection band forever
+//! while the lease erodes 2 s per cycle to a lapse). The protocol therefore
+//! gained a server-authoritative field: **`remaining_ttl_ms`** on both the
+//! create and extend responses (spec PR #148) — the remaining reservation
+//! lifetime in ms at response evaluation, same clock snapshot as
+//! `expires_at_ms`, present on successful live-reservation responses.
+//!
+//! When a successful response carries the field, scheduling is **normative**
+//! and exact:
+//!
+//! ```text
+//! lead_floor    = max(0, remaining_ttl_ms − rtt)         (rtt unknown → 0)
+//! retry_reserve = min(lead_floor/2, max(1 s, 2·max_observed_rtt))
+//! next_delay    = lead_floor − retry_reserve
+//! ```
+//!
+//! `rtt` is the monotonic elapsed between sending the call and receiving its
+//! response, so `lead_floor` is a floor on the lease actually left at
+//! receipt. The next beat is scheduled `next_delay` after response receipt —
+//! recomputed from **every** field-carrying response, never from accumulated
+//! expiry differences. The `lead_min` skip heuristic is **bypassed** while
+//! the latest successful response carried the field (the schedule is exact;
+//! a heuristic skip could overshoot the real lease), but the grant ledger
+//! below keeps running in the background so the heuristic takes over
+//! seamlessly if a later response omits the field (mixed fleets, rollbacks).
+//! A transient failure in this mode retries with the **same idempotency
+//! key** after `clamp(lead_estimate/4, 1 s, 30 s)`, where `lead_estimate` is
+//! the last `lead_floor` minus the monotonic time since that response
+//! (saturating at 0). When the **create** response carries the field, the
+//! first beat is scheduled from the same formula — no primed extension is
+//! spent, even under a maximum-lead clamp.
+//!
+//! Everything below describes the **fallback** used whenever a response does
+//! not carry `remaining_ttl_ms` (older servers).
+//!
+//! # Grant-ledger fallback (v2.3)
 //!
 //! ## The first beat is immediate
 //!
@@ -91,7 +132,13 @@
 //! a lead-clamped "grant" tracks the gap and stays inside the band. (A
 //! server granting less than twice the 500 ms floor per extend is
 //! observationally indistinguishable from a lead clamp at floor cadence and
-//! is conservatively held too.)
+//! is conservatively held too.) **The band is best-effort only** — round 5
+//! proved regime detection from `(grant, elapsed)` undecidable in general
+//! (sticky window: real grants in `[0.75·min(ttl/2, 30 s), 0.9·ttl)` track
+//! the held cadence closely enough to stay classified lead-clamp while the
+//! lease decays); `remaining_ttl_ms` above is the normative fix, and the
+//! band remains only to protect legacy servers that clamp per-extend
+//! deltas.
 //!
 //! Each next beat is scheduled from the previous beat's *intended* instant
 //! (`intended + delay`), so extend round-trips do not slip the cadence; if
@@ -224,6 +271,41 @@ fn advance(intended: tokio::time::Instant, delay: Duration) -> tokio::time::Inst
     (intended + delay).max(tokio::time::Instant::now())
 }
 
+// ─── Normative scheduling (`remaining_ttl_ms`, spec PR #148) ─────────────
+
+/// Floor on the lease actually left at response receipt: the server
+/// evaluated `remaining_ttl_ms` before the response travelled back, so at
+/// receipt the lease has at most `rtt` (the full round trip — an upper
+/// bound on the return leg) less remaining.
+fn lead_floor_ms(remaining_ttl_ms: u64, rtt_ms: u64) -> u64 {
+    remaining_ttl_ms.saturating_sub(rtt_ms)
+}
+
+/// Slack reserved at the end of the lease for the next extend to land and,
+/// if it fails transiently, be retried: `min(lead_floor/2, max(1 s,
+/// 2·max_observed_rtt))`. Never more than half the floor (tiny leases beat
+/// at floor/2), at least 1 s otherwise, widened when observed round trips
+/// are slow.
+fn retry_reserve_ms(lead_floor_ms: u64, max_rtt_ms: u64) -> u64 {
+    (lead_floor_ms / 2).min(max_rtt_ms.saturating_mul(2).max(1_000))
+}
+
+/// Delay from response receipt to the next beat in normative mode:
+/// `lead_floor − retry_reserve` (the reserve is at most half the floor, so
+/// this cannot underflow; a zero/near-zero floor beats immediately).
+fn remaining_next_delay_ms(remaining_ttl_ms: u64, rtt_ms: u64, max_rtt_ms: u64) -> u64 {
+    let lead = lead_floor_ms(remaining_ttl_ms, rtt_ms);
+    lead - retry_reserve_ms(lead, max_rtt_ms)
+}
+
+/// Same-key retry delay after a transient failure in normative mode:
+/// `clamp(lead_estimate/4, 1 s, 30 s)` — several retry opportunities within
+/// the known remaining lease, but never a sub-second hammer and never more
+/// than 30 s in the dark.
+fn remaining_retry_delay_ms(lead_estimate_ms: u64) -> u64 {
+    (lead_estimate_ms / 4).clamp(1_000, 30_000)
+}
+
 /// Spawn a background task that periodically extends a reservation's TTL.
 ///
 /// `requested_ttl_ms` is the TTL the caller asked for at reserve time. It is
@@ -237,7 +319,11 @@ fn advance(intended: tokio::time::Instant, delay: Duration) -> tokio::time::Inst
 /// reservations), the first grant cannot be measured and falls back to the
 /// requested amount.
 ///
-/// The first beat fires **immediately** — the only first-beat delay that
+/// `initial_remaining_ttl_ms` is the create response's `remaining_ttl_ms`
+/// (spec PR #148), and `create_rtt_ms` the reserve call's measured round
+/// trip. When the field is present, the first beat and all subsequent
+/// scheduling are **normative** (exact, server-authoritative); when absent,
+/// the first beat fires **immediately** — the only first-beat delay that
 /// provably cannot outlive an arbitrarily small tenant-capped lease (see
 /// module docs).
 ///
@@ -250,6 +336,8 @@ pub(crate) fn start_heartbeat(
     reservation_id: ReservationId,
     requested_ttl_ms: u64,
     initial_expires_at_ms: Option<u64>,
+    initial_remaining_ttl_ms: Option<u64>,
+    create_rtt_ms: u64,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -258,15 +346,37 @@ pub(crate) fn start_heartbeat(
         // elapsed_ms over-counts server elapsed time and lead_min stays a
         // lower bound.
         let anchor = tokio::time::Instant::now();
-        // Cadence used after a failure before any grant sample exists; the
-        // FIRST beat itself is immediate (next_beat == anchor).
+        // Fallback cadence used after a failure before any grant sample
+        // exists (fallback mode only).
         let mut delay = Duration::from_millis(held_cadence_ms(requested_ttl_ms));
+
+        // Normative-mode state: true while the most recent successful
+        // response carried remaining_ttl_ms; lead_sample is that response's
+        // (lead_floor, receipt instant) for failure-time lead estimates.
+        let mut normative = initial_remaining_ttl_ms.is_some();
+        let mut max_rtt_ms = create_rtt_ms;
+        let mut lead_sample: Option<(u64, tokio::time::Instant)> =
+            initial_remaining_ttl_ms.map(|r| (lead_floor_ms(r, create_rtt_ms), anchor));
+
         // The upcoming beat's *intended* instant; lead math measures elapsed
-        // to this, keeping it an exact sum of the scheduled delays.
-        let mut next_beat = anchor;
+        // to this. Normative when the create response carried the field,
+        // otherwise the immediate prime.
+        let mut next_beat = match initial_remaining_ttl_ms {
+            Some(remaining) => {
+                anchor
+                    + Duration::from_millis(remaining_next_delay_ms(
+                        remaining,
+                        create_rtt_ms,
+                        max_rtt_ms,
+                    ))
+            }
+            None => anchor,
+        };
 
         // Grant ledger: previous known server-frame expiry, sum of observed
         // grants, and the most recent grant (None until the first success).
+        // Maintained in BOTH modes so the fallback heuristic can take over
+        // if a response stops carrying remaining_ttl_ms.
         let mut prev_expiry = initial_expires_at_ms;
         let mut grants_sum_ms: i128 = 0;
         let mut last_grant_ms: Option<u64> = None;
@@ -285,8 +395,11 @@ pub(crate) fn start_heartbeat(
                 () = tokio::time::sleep_until(next_beat) => {}
             }
 
+            // The skip heuristic applies only in fallback mode: normative
+            // scheduling is exact, and a heuristic skip on top of it could
+            // overshoot the real lease.
             let elapsed_ms = next_beat.duration_since(anchor).as_millis();
-            if should_skip(lead_min_ms(grants_sum_ms, elapsed_ms), last_grant_ms) {
+            if !normative && should_skip(lead_min_ms(grants_sum_ms, elapsed_ms), last_grant_ms) {
                 next_beat = advance(next_beat, delay);
                 continue;
             }
@@ -297,8 +410,11 @@ pub(crate) fn start_heartbeat(
                 extend_by_ms: requested_ttl_ms,
                 metadata: None,
             };
+            let sent_at = tokio::time::Instant::now();
             match client.extend_reservation(&reservation_id, &req).await {
                 Ok(resp) => {
+                    let rtt_ms = u64::try_from(sent_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    max_rtt_ms = max_rtt_ms.max(rtt_ms);
                     pending_key = None;
                     // The grant is the difference of successive server-frame
                     // expiries (signed — an expiry that moved backwards is a
@@ -316,33 +432,58 @@ pub(crate) fn start_heartbeat(
                     let elapsed_since_success = next_beat.duration_since(last_success).as_millis();
                     last_success = next_beat;
                     // Ledger counts max(grant, 0); the skip rule and cadence
-                    // never see negative amounts.
+                    // never see negative amounts. Maintained even in
+                    // normative mode so the fallback can resume seamlessly.
                     let counted = u64::try_from(grant.max(0)).unwrap_or(u64::MAX);
                     grants_sum_ms += i128::from(counted);
                     last_grant_ms = Some(counted);
-                    if is_lead_clamp_grant(grant, requested_ttl_ms, elapsed_since_success) {
-                        // The observed "grant" tracks elapsed time, not the
-                        // requested lease: pacing by it would collapse the
-                        // cadence to the floor and burn max_extensions in
-                        // seconds. Hold at min(requested/2, 30 s) instead.
-                        delay = Duration::from_millis(held_cadence_ms(requested_ttl_ms));
-                        if !warned_lead_clamp {
-                            warned_lead_clamp = true;
-                            tracing::warn!(
-                                reservation_id = %reservation_id,
-                                grant_ms = %grant,
-                                elapsed_ms = %elapsed_since_success,
-                                requested_ttl_ms,
-                                held_cadence_ms = held_cadence_ms(requested_ttl_ms),
-                                "extend grants track elapsed time, not the requested \
-                                 lease — server appears to clamp the reservation's \
-                                 maximum lead; holding heartbeat cadence to avoid \
-                                 depleting the extension allowance"
-                            );
+                    match resp.remaining_ttl_ms {
+                        Some(remaining) => {
+                            // Normative: the server told us exactly how much
+                            // lease is left; schedule next_delay after
+                            // receipt. Expiry-difference heuristics are not
+                            // used for scheduling in this mode.
+                            normative = true;
+                            let received = tokio::time::Instant::now();
+                            let floor = lead_floor_ms(remaining, rtt_ms);
+                            lead_sample = Some((floor, received));
+                            delay = Duration::from_millis(remaining_next_delay_ms(
+                                remaining, rtt_ms, max_rtt_ms,
+                            ));
+                            next_beat = received + delay;
                         }
-                    } else {
-                        delay =
-                            Duration::from_millis(next_beat_delay_ms(counted, requested_ttl_ms));
+                        None => {
+                            // Fallback: v2.3 grant-ledger regime.
+                            normative = false;
+                            if is_lead_clamp_grant(grant, requested_ttl_ms, elapsed_since_success) {
+                                // The observed "grant" tracks elapsed time,
+                                // not the requested lease: pacing by it
+                                // would collapse the cadence to the floor
+                                // and burn max_extensions in seconds. Hold
+                                // at min(requested/2, 30 s) instead.
+                                delay = Duration::from_millis(held_cadence_ms(requested_ttl_ms));
+                                if !warned_lead_clamp {
+                                    warned_lead_clamp = true;
+                                    tracing::warn!(
+                                        reservation_id = %reservation_id,
+                                        grant_ms = %grant,
+                                        elapsed_ms = %elapsed_since_success,
+                                        requested_ttl_ms,
+                                        held_cadence_ms = held_cadence_ms(requested_ttl_ms),
+                                        "extend grants track elapsed time, not the requested \
+                                         lease — server appears to clamp the reservation's \
+                                         maximum lead; holding heartbeat cadence to avoid \
+                                         depleting the extension allowance"
+                                    );
+                                }
+                            } else {
+                                delay = Duration::from_millis(next_beat_delay_ms(
+                                    counted,
+                                    requested_ttl_ms,
+                                ));
+                            }
+                            next_beat = advance(next_beat, delay);
+                        }
                     }
                     // Any 2xx means the server applied the extension;
                     // `expires_at_ms` (required by the spec response schema)
@@ -365,9 +506,23 @@ pub(crate) fn start_heartbeat(
                     break;
                 }
                 Err(e) => {
-                    // Keep the key (the retry must dedupe against a possibly
-                    // applied-but-lost extension) and the current delay.
+                    // Keep the key: the retry must dedupe against a possibly
+                    // applied-but-lost extension.
                     pending_key = Some(key);
+                    if normative {
+                        // Retry paced by the known remaining lease: the last
+                        // lead floor minus time elapsed since that response.
+                        let lead_now = lead_sample.map_or(0, |(floor, at)| {
+                            floor.saturating_sub(
+                                u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            )
+                        });
+                        next_beat = tokio::time::Instant::now()
+                            + Duration::from_millis(remaining_retry_delay_ms(lead_now));
+                    } else {
+                        // Fallback: retry at the current cadence.
+                        next_beat = advance(next_beat, delay);
+                    }
                     tracing::warn!(
                         reservation_id = %reservation_id,
                         error = %e,
@@ -375,7 +530,6 @@ pub(crate) fn start_heartbeat(
                     );
                 }
             }
-            next_beat = advance(next_beat, delay);
         }
     })
 }
@@ -507,6 +661,44 @@ mod tests {
         // Capped-grant scenario from the wiremock suite: requested 8000,
         // grants of 2000 → 1000 ms beats.
         assert_eq!(next_beat_delay_ms(2_000, 8_000), 1_000);
+    }
+
+    #[test]
+    fn lead_floor_subtracts_rtt_and_saturates() {
+        assert_eq!(lead_floor_ms(2_000, 3), 1_997);
+        assert_eq!(lead_floor_ms(2_000, 0), 2_000);
+        // rtt exceeding the reported remaining → floor 0, never wraps.
+        assert_eq!(lead_floor_ms(100, 200), 0);
+    }
+
+    #[test]
+    fn remaining_next_delay_pins() {
+        // Spec pin: remaining 60 s, negligible rtt → reserve =
+        // max(1 s, 2·rtt) = 1 s → next beat 59 s after receipt.
+        assert_eq!(remaining_next_delay_ms(60_000, 0, 0), 59_000);
+        // Slow observed round trips widen the reserve: 2·5000 = 10 s.
+        assert_eq!(remaining_next_delay_ms(60_000, 0, 5_000), 50_000);
+        // rtt shaves the floor first: lead 59 500, reserve 1000.
+        assert_eq!(remaining_next_delay_ms(60_000, 500, 500), 58_500);
+        // Capped-create pin: remaining 1000 → reserve = min(500, 1000) =
+        // 500 → the first beat lands at 500 ms, inside the real 1 s lease.
+        assert_eq!(remaining_next_delay_ms(1_000, 0, 0), 500);
+        // The reserve never exceeds half the floor, however slow the rtts.
+        assert_eq!(remaining_next_delay_ms(1_500, 0, 10_000), 750);
+        // Zero/exhausted lease → beat immediately.
+        assert_eq!(remaining_next_delay_ms(0, 0, 0), 0);
+        assert_eq!(remaining_next_delay_ms(100, 200, 200), 0);
+    }
+
+    #[test]
+    fn remaining_retry_delay_is_quarter_lead_clamped() {
+        // Floor: never a sub-second hammer, even with no lease left.
+        assert_eq!(remaining_retry_delay_ms(0), 1_000);
+        assert_eq!(remaining_retry_delay_ms(997), 1_000);
+        // Quarter of the current lead estimate.
+        assert_eq!(remaining_retry_delay_ms(8_000), 2_000);
+        // Cap: never more than 30 s in the dark.
+        assert_eq!(remaining_retry_delay_ms(1_000_000), 30_000);
     }
 
     #[test]

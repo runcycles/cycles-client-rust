@@ -169,7 +169,12 @@ impl CyclesClient {
         validation::validate_grace_period_ms(req.grace_period_ms)?;
         validation::validate_non_negative(req.estimate.amount, "estimate.amount")?;
 
+        // Round-trip time of the reserve call: when the response carries
+        // remaining_ttl_ms (spec PR #148), the heartbeat subtracts this from
+        // it to get a floor on the lease actually left at receipt.
+        let sent_at = std::time::Instant::now();
         let resp = self.create_reservation(&req).await?;
+        let create_rtt_ms = u64::try_from(sent_at.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         if resp.decision.is_denied() {
             return Err(Error::BudgetExceeded {
@@ -229,6 +234,8 @@ impl CyclesClient {
             resp.expires_at_ms,
             resp.affected_scopes.clone(),
             req.ttl_ms,
+            resp.remaining_ttl_ms,
+            create_rtt_ms,
             req.subject.clone(),
             req.action.clone(),
         ))

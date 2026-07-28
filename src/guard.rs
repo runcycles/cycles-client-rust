@@ -83,20 +83,27 @@ impl ReservationGuard {
         expires_at_ms: Option<u64>,
         affected_scopes: Vec<String>,
         requested_ttl_ms: u64,
+        remaining_ttl_ms: Option<u64>,
+        create_rtt_ms: u64,
         subject: Subject,
         action: Action,
     ) -> Self {
         let cancel = CancellationToken::new();
         // The reserve response's expires_at_ms (server frame) is the base of
-        // the heartbeat's grant ledger. The first extend fires immediately —
-        // a tenant policy may have silently capped the lease far below the
-        // requested TTL, and no bounded delay provably beats an arbitrarily
-        // small grant; see src/heartbeat.rs module docs.
+        // the heartbeat's grant ledger. When the response carries
+        // remaining_ttl_ms (spec PR #148) the heartbeat schedules from it
+        // normatively, with create_rtt_ms bounding the sample's staleness;
+        // otherwise the first extend fires immediately — a tenant policy may
+        // have silently capped the lease far below the requested TTL, and no
+        // bounded delay provably beats an arbitrarily small grant; see
+        // src/heartbeat.rs module docs.
         let heartbeat = start_heartbeat(
             client.clone(),
             id.clone(),
             requested_ttl_ms,
             expires_at_ms,
+            remaining_ttl_ms,
+            create_rtt_ms,
             cancel.clone(),
         );
 

@@ -8,7 +8,7 @@
 
 ---
 
-## 2026-07-27 — heartbeat extend-drift fix, grant-ledger v2.3 (v0.3.1)
+## 2026-07-27/28 — heartbeat extend-drift fix: `remaining_ttl_ms` normative scheduling + grant-ledger fallback (v0.3.1)
 
 P1 liveness, fleet-wide (same bug in all four SDKs). The spec's `extend_by_ms`
 is relative to the reservation's *current* `expires_at_ms`, not request time,
@@ -39,7 +39,29 @@ found that under a server-side **maximum-LEAD clamp** (extend re-stamps
 `expires_at ≈ now + L`) successive `expires_at_ms` differences measure
 *elapsed time, not lease* — grant-derived cadence is self-referential there
 and collapses to the 500 ms floor, burning `max_extensions` in seconds.
-Final **grant-ledger (v2.3)** design: correctness rests on
+Spec review round 5 (user-approved) then proved regime detection from
+`(grant, elapsed)` samples **undecidable in general** — real per-extend
+grants in the sticky window `[0.75·min(ttl/2, 30 s), 0.9·ttl)` track the
+held cadence closely enough to stay classified lead-clamp while the lease
+erodes to a lapse (ttl 24 s, +10 s grants → held 12 s → ratio 10/12 inside
+the band forever, −2 s per cycle) — so the protocol gained a
+server-authoritative field (spec PR #148): **`remaining_ttl_ms`** on both
+`ReservationCreateResponse` and `ExtendResponse` (int64 ≥ 0, remaining
+lifetime at response evaluation, same clock snapshot as `expires_at_ms`,
+optional in the client models for back-compat). When present, scheduling is
+**normative**: `lead_floor = max(0, remaining − rtt)` (rtt = monotonic
+send→receive elapsed, unknown → 0; max observed rtt tracked per heartbeat),
+`retry_reserve = min(lead_floor/2, max(1 s, 2·max_rtt))`, next beat at
+`lead_floor − retry_reserve` after receipt — recomputed from every
+field-carrying response, never from accumulated expiry differences; the
+`lead_min` skip check is bypassed (exact schedule; a heuristic skip could
+overshoot the real lease) while the ledger keeps running for seamless
+fallback if the field disappears; transient failures retry same-key after
+`clamp(lead_estimate/4, 1 s, 30 s)`; a field-carrying create derives the
+first beat from the same formula instead of the immediate prime (no wasted
+extension under max-lead clamping). The grant-ledger heuristic below is
+retained verbatim as the fallback for servers without the field.
+**Grant-ledger fallback (v2.3)** design: correctness rests on
 `lead_min = grants_sum − elapsed` (signed, starts 0), a rigorous lower bound
 built only from same-frame arithmetic — each grant is the difference of
 successive server-frame `expires_at_ms` values (reserve's threaded from the
@@ -59,17 +81,25 @@ equivalent, hand-rolled for variable delays). Any 2xx counts as applied
 (`expires_at_ms` authoritative, warn on odd status); permanent codes
 (`RESERVATION_EXPIRED`/`RESERVATION_FINALIZED`/`MAX_EXTENSIONS_EXCEEDED`/
 `TENANT_CLOSED`/`NOT_FOUND` or HTTP 410/404) stop the heartbeat.
-Cancellation unchanged. Eleven wiremock tests with dynamic expiry responders
-(immediate first beat + extend@0/1000/2000, skip@3000, extend@4000; capped
-grant keeping `extend_by_ms` at the request while the immediate beat
-discovers the cap; 503 on the immediate beat → single held-cadence retry
-with the same key; permanent stops; small-ttl liveness; per-extend grant
-clamp still tightening to grant/2; lead-clamp echo responder holding
-cadence instead of collapsing; zero-grant immediate prime holding cadence;
-unknown-status 200 as applied) + extracted pure cadence/regime functions
-unit-tested (incl. the 30 s held-cadence cap and the lead-clamp band
-boundaries) in `src/heartbeat.rs`; `Date`-parsing unit tests in
-`src/response.rs`. Coverage 95.12%; tests, clippy `-D warnings`, fmt green.
+Cancellation unchanged. Sixteen wiremock tests with dynamic expiry
+responders — fallback: immediate first beat + extend@0/1000/2000,
+skip@3000, extend@4000; capped grant keeping `extend_by_ms` at the request
+while the immediate beat discovers the cap; 503 on the immediate beat →
+single held-cadence retry with the same key; permanent stops; small-ttl
+liveness; per-extend grant clamp still tightening to grant/2; lead-clamp
+echo responder holding cadence instead of collapsing; zero-grant immediate
+prime holding cadence; unknown-status 200 as applied — normative: no prime
++ `lead_floor − retry_reserve` first beat; skip bypass under accumulating
+grants; capped 1 s lease first-beating at ~500 ms inside the lease;
+field-carrying max-lead clamp at ~cap − reserve with no collapse; field
+disappearing mid-flight → heuristic resuming (with its skip) on the
+ledger maintained through the normative phase; same-key normative retry at
+`clamp(lead/4, 1 s, 30 s)`. Extracted pure scheduling functions
+unit-tested (30 s held-cadence cap, lead-clamp band boundaries, 60 s → 59 s
+normative delay pin, rtt widening/saturation, retry-clamp bounds) in
+`src/heartbeat.rs`; `remaining_ttl_ms` wire-format serde tests in
+`tests/models_test.rs`; `Date`-parsing unit tests in `src/response.rs`.
+Coverage 95.26%; tests, clippy `-D warnings`, fmt green.
 
 ## 2026-07-27 — v0.3.0 self-review hardening
 
