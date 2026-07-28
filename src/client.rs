@@ -171,10 +171,11 @@ impl CyclesClient {
 
         // Round-trip time of the reserve call: when the response carries
         // remaining_ttl_ms (spec PR #148), the heartbeat subtracts this from
-        // it to get a floor on the lease actually left at receipt.
+        // it to get a floor on the lease actually left at receipt. Rounded
+        // up — consumed lease must never be under-counted.
         let sent_at = std::time::Instant::now();
         let resp = self.create_reservation(&req).await?;
-        let create_rtt_ms = u64::try_from(sent_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let create_rtt_ms = crate::heartbeat::ceil_ms(sent_at.elapsed());
 
         if resp.decision.is_denied() {
             return Err(Error::BudgetExceeded {
@@ -294,6 +295,53 @@ impl CyclesClient {
         let path = format!("{RESERVATIONS_PATH}/{}/extend", id.as_str());
         self.post_json(&path, req, Some(req.idempotency_key.as_str()))
             .await
+    }
+
+    /// Extend with the spec's strict field-mode success predicate: only a
+    /// **schema-valid HTTP 200** `ReservationExtendResponse` counts as an
+    /// observed success. A different 2xx status, or a 200 whose body does
+    /// not parse against the schema, is *ambiguous* — surfaced as
+    /// [`Error::Deserialization`] so the heartbeat's primary-path recovery
+    /// treats it as a transient failure and retries with the same
+    /// idempotency key (see the HEARTBEAT GUIDANCE in
+    /// `cycles-protocol-v0.yaml`). Non-2xx responses parse into the usual
+    /// typed errors (including 429 `Retry-After`).
+    pub(crate) async fn extend_reservation_strict(
+        &self,
+        id: &ReservationId,
+        req: &ExtendRequest,
+    ) -> Result<ExtendResponse, Error> {
+        let url = format!(
+            "{}{RESERVATIONS_PATH}/{}/extend",
+            self.inner.config.base_url,
+            id.as_str()
+        );
+        let resp = self
+            .inner
+            .http
+            .post(&url)
+            .header(API_KEY_HEADER, &self.inner.config.api_key)
+            .header(IDEMPOTENCY_KEY_HEADER, req.idempotency_key.as_str())
+            .json(req)
+            .send()
+            .await?;
+        let response_headers = resp.headers().clone();
+        let status = resp.status().as_u16();
+        if status == 200 {
+            resp.json().await.map_err(|e| {
+                Error::Deserialization(serde::de::Error::custom(format!(
+                    "ambiguous extend response: HTTP 200 body is not a schema-valid ReservationExtendResponse: {e}"
+                )))
+            })
+        } else if (200..300).contains(&status) {
+            Err(Error::Deserialization(serde::de::Error::custom(format!(
+                "ambiguous extend response: HTTP {status} is a non-200 2xx and cannot be used to schedule from"
+            ))))
+        } else {
+            Err(self
+                .parse_error_response(status, resp, &response_headers)
+                .await)
+        }
     }
 
     /// Preflight budget decision check (no reservation created).

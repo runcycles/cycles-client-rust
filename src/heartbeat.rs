@@ -20,32 +20,68 @@
 //! `expires_at_ms`, present on successful live-reservation responses.
 //!
 //! When a successful response carries the field, scheduling is **normative**
-//! and exact:
+//! per the spec's HEARTBEAT GUIDANCE (`cycles-protocol-v0.yaml`, spec PR
+//! #148 head `dd60c27`). Only a **schema-valid HTTP 200**
+//! `ReservationExtendResponse` (or the create response, for the first beat)
+//! counts as an observed success; any other or malformed 2xx is *ambiguous*
+//! and handled as a transient failure with same-key recovery. On every
+//! success, recompute from that response alone — never from accumulated
+//! expiry differences:
 //!
 //! ```text
-//! lead_floor    = max(0, remaining_ttl_ms − rtt)         (rtt unknown → 0)
-//! retry_reserve = min(lead_floor/2, max(1 s, 2·max_observed_rtt))
-//! next_delay    = lead_floor − retry_reserve
+//! rtt            = monotonic(response_received − attempt_sent)   (per attempt)
+//! lead_floor     = max(0, remaining_ttl_ms − rtt)
+//! attempt_budget = max(request_timeout_budget, 1 s, 2·max_observed_rtt)
+//! safety_margin  = max(1 s, 2·max_observed_rtt)
+//! retry_reserve  = 2·attempt_budget + safety_margin
+//! next_delay     = max(0, lead_floor − retry_reserve)
 //! ```
 //!
-//! `rtt` is the monotonic elapsed between sending the call and receiving its
-//! response, so `lead_floor` is a floor on the lease actually left at
-//! receipt. The next beat is scheduled `next_delay` after response receipt —
-//! recomputed from **every** field-carrying response, never from accumulated
-//! expiry differences. The `lead_min` skip heuristic is **bypassed** while
-//! the latest successful response carried the field (the schedule is exact;
-//! a heuristic skip could overshoot the real lease), but the grant ledger
-//! below keeps running in the background so the heuristic takes over
+//! `request_timeout_budget` is the client's **enforced** finite per-attempt
+//! bound for one complete extend call — this SDK always builds its reqwest
+//! client with `.timeout(connect_timeout + read_timeout)`, so the budget is
+//! always finite (an unknown/unbounded budget would be positive infinity,
+//! forcing `next_delay = 0`). All arithmetic is overflow-safe saturating
+//! milliseconds; budgets/margins round up, leads/delays round down. The next
+//! beat is scheduled `next_delay` after response receipt. The `lead_min`
+//! skip heuristic is **bypassed** while the latest success carried the field
+//! (the schedule is exact; a heuristic skip could overshoot the real lease),
+//! but the grant ledger below keeps running so the heuristic takes over
 //! seamlessly if a later response omits the field (mixed fleets, rollbacks).
-//! A transient failure in this mode retries with the **same idempotency
-//! key** after `clamp(lead_estimate/4, 1 s, 30 s)`, where `lead_estimate` is
-//! the last `lead_floor` minus the monotonic time since that response
-//! (saturating at 0). When the **create** response carries the field, the
-//! first beat is scheduled from the same formula — no primed extension is
-//! spent, even under a maximum-lead clamp.
+//! Same-key create/extend replays are safe to schedule from — the server
+//! recomputes `remaining_ttl_ms` at replay-response construction time — and
+//! `rtt` is always the *individual attempt's* own timing, never an earlier
+//! attempt's.
+//!
+//! **Zero-delay guard:** when a schema-valid success produces
+//! `next_delay = 0`, one immediate fresh-key extension may follow; if that
+//! success also produces 0, the heartbeat stops and surfaces (warn) that the
+//! lease is shorter than its retry-safety budget — an additive-delta server
+//! gets its one immediate extension to establish a larger lead, while a
+//! maximum-lead server's extension budget is never burned in a tight loop.
+//!
+//! **Recovery** (timeout, connection error, 5xx, 429, ambiguous 2xx):
+//! `current_lead_estimate = max(0, last lead_floor − elapsed since the
+//! schema-valid response that established it)`; `retry_window =
+//! current_lead_estimate − attempt_budget − safety_margin` (signed, not
+//! clamped). Negative window → no complete retry plus margin is provably
+//! safe: stop and surface. Otherwise non-429 failures retry with the **same
+//! idempotency key** after `min(30 s, lead_estimate/4, retry_window)`; a 429
+//! retries after exactly `Retry-After` (delta-seconds × 1000, checked) and
+//! only when that fits the window — missing/invalid/oversized `Retry-After`
+//! stops rather than inventing an earlier retry that violates throttling.
+//! Recovery may repeat: lead/window are recomputed from the same last
+//! schema-valid response after every failure, continuing while the window
+//! stays positive; a zero window permits one immediate retry, and a
+//! progress guard stops the loop when the window fails to decrease between
+//! consecutive failures. Any **other 4xx** stops and surfaces without
+//! rotating the idempotency key. When the **create** response carries the
+//! field, the first beat is scheduled from the same formula — no primed
+//! extension is spent, even under a maximum-lead clamp.
 //!
 //! Everything below describes the **fallback** used whenever a response does
-//! not carry `remaining_ttl_ms` (older servers).
+//! not carry `remaining_ttl_ms` (older servers). The fallback keeps its own
+//! semantics unchanged, including any-2xx-as-applied.
 //!
 //! # Grant-ledger fallback (v2.3)
 //!
@@ -272,6 +308,20 @@ fn advance(intended: tokio::time::Instant, delay: Duration) -> tokio::time::Inst
 }
 
 // ─── Normative scheduling (`remaining_ttl_ms`, spec PR #148) ─────────────
+//
+// Overflow-safe saturating millisecond arithmetic throughout; an unknown or
+// unbounded attempt budget is `None` (positive infinity — no safe positive
+// delay exists over it). Rounding direction per spec: attempt budgets and
+// safety margins round up, lead lower bounds and scheduling/retry delays
+// round down (`ceil_ms` rounds the *consumed* rtt and elapsed measurements
+// up, which rounds the derived leads down).
+
+/// A `Duration` in whole milliseconds, rounded **up** — for round trips and
+/// elapsed-time measurements that are *subtracted* from leases, so rounding
+/// can never fabricate lease.
+pub(crate) fn ceil_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
+}
 
 /// Floor on the lease actually left at response receipt: the server
 /// evaluated `remaining_ttl_ms` before the response travelled back, so at
@@ -281,29 +331,87 @@ fn lead_floor_ms(remaining_ttl_ms: u64, rtt_ms: u64) -> u64 {
     remaining_ttl_ms.saturating_sub(rtt_ms)
 }
 
-/// Slack reserved at the end of the lease for the next extend to land and,
-/// if it fails transiently, be retried: `min(lead_floor/2, max(1 s,
-/// 2·max_observed_rtt))`. Never more than half the floor (tiny leases beat
-/// at floor/2), at least 1 s otherwise, widened when observed round trips
-/// are slow.
-fn retry_reserve_ms(lead_floor_ms: u64, max_rtt_ms: u64) -> u64 {
-    (lead_floor_ms / 2).min(max_rtt_ms.saturating_mul(2).max(1_000))
+/// Upper bound on one complete extend attempt (connect, write, read, and
+/// failure detection): `max(request_timeout_budget, 1 s, 2·max_observed
+/// rtt)`. `None` (unknown/unbounded per-attempt timeout) is positive
+/// infinity.
+fn attempt_budget_ms(request_timeout_ms: Option<u64>, max_rtt_ms: u64) -> Option<u64> {
+    request_timeout_ms.map(|t| t.max(1_000).max(max_rtt_ms.saturating_mul(2)))
+}
+
+/// Scheduling/network slack on top of the attempt budget:
+/// `max(1 s, 2·max_observed rtt)`.
+fn safety_margin_ms(max_rtt_ms: u64) -> u64 {
+    max_rtt_ms.saturating_mul(2).max(1_000)
+}
+
+/// Lease reserved for recovery — one failed attempt, one same-key retry,
+/// and margin: `2·attempt_budget + safety_margin`. `None` = infinity.
+fn retry_reserve_ms(request_timeout_ms: Option<u64>, max_rtt_ms: u64) -> Option<u64> {
+    attempt_budget_ms(request_timeout_ms, max_rtt_ms).map(|b| {
+        b.saturating_mul(2)
+            .saturating_add(safety_margin_ms(max_rtt_ms))
+    })
 }
 
 /// Delay from response receipt to the next beat in normative mode:
-/// `lead_floor − retry_reserve` (the reserve is at most half the floor, so
-/// this cannot underflow; a zero/near-zero floor beats immediately).
-fn remaining_next_delay_ms(remaining_ttl_ms: u64, rtt_ms: u64, max_rtt_ms: u64) -> u64 {
-    let lead = lead_floor_ms(remaining_ttl_ms, rtt_ms);
-    lead - retry_reserve_ms(lead, max_rtt_ms)
+/// `max(0, lead_floor − retry_reserve)`. Zero when the lease cannot hold
+/// the full recovery reserve (the zero-delay guard bounds how often that
+/// may recur) or when the attempt budget is unbounded.
+fn remaining_next_delay_ms(
+    remaining_ttl_ms: u64,
+    rtt_ms: u64,
+    request_timeout_ms: Option<u64>,
+    max_rtt_ms: u64,
+) -> u64 {
+    match retry_reserve_ms(request_timeout_ms, max_rtt_ms) {
+        Some(reserve) => lead_floor_ms(remaining_ttl_ms, rtt_ms).saturating_sub(reserve),
+        None => 0,
+    }
 }
 
-/// Same-key retry delay after a transient failure in normative mode:
-/// `clamp(lead_estimate/4, 1 s, 30 s)` — several retry opportunities within
-/// the known remaining lease, but never a sub-second hammer and never more
-/// than 30 s in the dark.
-fn remaining_retry_delay_ms(lead_estimate_ms: u64) -> u64 {
-    (lead_estimate_ms / 4).clamp(1_000, 30_000)
+/// Signed recovery window after a transient failure in normative mode:
+/// `current_lead_estimate − attempt_budget − safety_margin`, WITHOUT
+/// clamping — negative means no complete retry plus margin is provably safe
+/// and the client must stop. `None` when the attempt budget is unbounded
+/// (equally: no provably safe retry).
+fn recovery_window_ms(
+    lead_estimate_ms: u64,
+    request_timeout_ms: Option<u64>,
+    max_rtt_ms: u64,
+) -> Option<i128> {
+    attempt_budget_ms(request_timeout_ms, max_rtt_ms).map(|budget| {
+        i128::from(lead_estimate_ms) - i128::from(budget) - i128::from(safety_margin_ms(max_rtt_ms))
+    })
+}
+
+/// Same-key retry delay for a non-429 transient failure when the recovery
+/// window is non-negative: `min(30 s, lead_estimate/4, retry_window)`. A
+/// zero window retries immediately — once; the progress guard stops a
+/// second zero-window failure.
+fn recovery_delay_ms(lead_estimate_ms: u64, window_ms: i128) -> u64 {
+    let window = u64::try_from(window_ms).unwrap_or(0);
+    30_000.min(lead_estimate_ms / 4).min(window)
+}
+
+/// Progress guard for repeated recovery: `true` when the freshly recomputed
+/// window failed to DECREASE since the previous failure of the same
+/// recovery run — the window shrinks exactly when monotonic elapsed grows,
+/// so a non-decreasing window means a zero-time recovery loop (including
+/// the second failure at a coarse-clock window of 0), which must stop.
+fn recovery_stalled(window_ms: i128, previous_window_ms: Option<i128>) -> bool {
+    previous_window_ms.is_some_and(|prev| window_ms >= prev)
+}
+
+/// `true` for failure classes the primary (field-mode) algorithm recovers
+/// from with the same idempotency key: timeout/connection errors
+/// (`Transport`), ambiguous 2xx (`Deserialization` — a schema-invalid or
+/// non-200 2xx body), 5xx, and 429. Everything else — notably other 4xx —
+/// stops and surfaces without key rotation (permanent codes are classified
+/// before this).
+fn is_recoverable_in_field_mode(e: &Error) -> bool {
+    matches!(e, Error::Transport(_) | Error::Deserialization(_))
+        || matches!(e.status(), Some(s) if s >= 500 || s == 429)
 }
 
 /// Spawn a background task that periodically extends a reservation's TTL.
@@ -350,25 +458,48 @@ pub(crate) fn start_heartbeat(
         // exists (fallback mode only).
         let mut delay = Duration::from_millis(held_cadence_ms(requested_ttl_ms));
 
-        // Normative-mode state: true while the most recent successful
-        // response carried remaining_ttl_ms; lead_sample is that response's
-        // (lead_floor, receipt instant) for failure-time lead estimates.
+        // The client's ENFORCED finite per-attempt bound for one complete
+        // extend call: the reqwest client is built with
+        // `.timeout(connect_timeout + read_timeout)`. Rounded up (budget).
+        // An unknown/unbounded budget would be None (positive infinity).
+        let request_timeout_ms: Option<u64> = Some(ceil_ms(
+            client.config().connect_timeout + client.config().read_timeout,
+        ));
+
+        // Normative-mode state: true while the most recent schema-valid
+        // success carried remaining_ttl_ms; lead_sample is that response's
+        // (lead_floor, receipt instant) for recovery lead estimates.
         let mut normative = initial_remaining_ttl_ms.is_some();
         let mut max_rtt_ms = create_rtt_ms;
         let mut lead_sample: Option<(u64, tokio::time::Instant)> =
             initial_remaining_ttl_ms.map(|r| (lead_floor_ms(r, create_rtt_ms), anchor));
+        // Consecutive schema-valid successes whose next_delay was 0 (the
+        // field-carrying create counts). Two in a row → the lease is
+        // shorter than the retry-safety budget → stop.
+        let mut zero_delay_streak: u32 = 0;
+        // Previous failure's recovery window in the current recovery run
+        // (None outside recovery): the progress guard stops the run when
+        // the window fails to decrease between consecutive failures.
+        let mut last_recovery_window: Option<i128> = None;
 
         // The upcoming beat's *intended* instant; lead math measures elapsed
         // to this. Normative when the create response carried the field,
         // otherwise the immediate prime.
         let mut next_beat = match initial_remaining_ttl_ms {
             Some(remaining) => {
-                anchor
-                    + Duration::from_millis(remaining_next_delay_ms(
-                        remaining,
-                        create_rtt_ms,
-                        max_rtt_ms,
-                    ))
+                let nd = remaining_next_delay_ms(
+                    remaining,
+                    create_rtt_ms,
+                    request_timeout_ms,
+                    max_rtt_ms,
+                );
+                if nd == 0 {
+                    // Zero-delay guard, first arm: the create's lease cannot
+                    // hold the recovery reserve — one immediate fresh-key
+                    // extension is permitted.
+                    zero_delay_streak = 1;
+                }
+                anchor + Duration::from_millis(nd)
             }
             None => anchor,
         };
@@ -411,11 +542,26 @@ pub(crate) fn start_heartbeat(
                 metadata: None,
             };
             let sent_at = tokio::time::Instant::now();
-            match client.extend_reservation(&reservation_id, &req).await {
+            // In field mode only a schema-valid HTTP 200 counts as success
+            // (a different or malformed 2xx is ambiguous — surfaced as an
+            // error and recovered same-key below); the fallback keeps its
+            // any-2xx-as-applied semantics.
+            let result = if normative {
+                client
+                    .extend_reservation_strict(&reservation_id, &req)
+                    .await
+            } else {
+                client.extend_reservation(&reservation_id, &req).await
+            };
+            match result {
                 Ok(resp) => {
-                    let rtt_ms = u64::try_from(sent_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    // Per-attempt rtt (never an earlier attempt's timing —
+                    // same-key replays recompute remaining_ttl_ms server
+                    // side), rounded up: it is subtracted from the lease.
+                    let rtt_ms = ceil_ms(sent_at.elapsed());
                     max_rtt_ms = max_rtt_ms.max(rtt_ms);
                     pending_key = None;
+                    last_recovery_window = None;
                     // The grant is the difference of successive server-frame
                     // expiries (signed — an expiry that moved backwards is a
                     // negative grant, classified lead-clamp and counted as
@@ -447,14 +593,42 @@ pub(crate) fn start_heartbeat(
                             let received = tokio::time::Instant::now();
                             let floor = lead_floor_ms(remaining, rtt_ms);
                             lead_sample = Some((floor, received));
-                            delay = Duration::from_millis(remaining_next_delay_ms(
-                                remaining, rtt_ms, max_rtt_ms,
-                            ));
-                            next_beat = received + delay;
+                            let nd = remaining_next_delay_ms(
+                                remaining,
+                                rtt_ms,
+                                request_timeout_ms,
+                                max_rtt_ms,
+                            );
+                            if nd == 0 {
+                                // Zero-delay guard: one immediate FRESH-key
+                                // extension may follow a zero-delay success
+                                // (an additive-delta server can establish a
+                                // larger lead with it); a second zero-delay
+                                // success in a row proves the lease is
+                                // shorter than the retry-safety budget —
+                                // stop rather than burn a maximum-lead
+                                // server's extension budget in a tight loop.
+                                zero_delay_streak += 1;
+                                if zero_delay_streak >= 2 {
+                                    tracing::warn!(
+                                        reservation_id = %reservation_id,
+                                        remaining_ttl_ms = remaining,
+                                        retry_reserve_ms =
+                                            ?retry_reserve_ms(request_timeout_ms, max_rtt_ms),
+                                        "reservation lease is shorter than the heartbeat's retry-safety budget (next_delay = 0 twice in a row); stopping heartbeat"
+                                    );
+                                    break;
+                                }
+                                next_beat = received;
+                            } else {
+                                zero_delay_streak = 0;
+                                next_beat = received + Duration::from_millis(nd);
+                            }
                         }
                         None => {
                             // Fallback: v2.3 grant-ledger regime.
                             normative = false;
+                            zero_delay_streak = 0;
                             if is_lead_clamp_grant(grant, requested_ttl_ms, elapsed_since_success) {
                                 // The observed "grant" tracks elapsed time,
                                 // not the requested lease: pacing by it
@@ -470,10 +644,7 @@ pub(crate) fn start_heartbeat(
                                         elapsed_ms = %elapsed_since_success,
                                         requested_ttl_ms,
                                         held_cadence_ms = held_cadence_ms(requested_ttl_ms),
-                                        "extend grants track elapsed time, not the requested \
-                                         lease — server appears to clamp the reservation's \
-                                         maximum lead; holding heartbeat cadence to avoid \
-                                         depleting the extension allowance"
+                                        "extend grants track elapsed time, not the requested lease — server appears to clamp the reservation's maximum lead; holding heartbeat cadence to avoid depleting the extension allowance"
                                     );
                                 }
                             } else {
@@ -492,8 +663,7 @@ pub(crate) fn start_heartbeat(
                         tracing::warn!(
                             reservation_id = %reservation_id,
                             status = ?resp.status,
-                            "heartbeat extend returned 2xx with unrecognized status; \
-                             treating as applied (expires_at_ms is authoritative)"
+                            "heartbeat extend returned 2xx with unrecognized status; treating as applied (expires_at_ms is authoritative)"
                         );
                     }
                 }
@@ -505,24 +675,88 @@ pub(crate) fn start_heartbeat(
                     );
                     break;
                 }
-                Err(e) => {
-                    // Keep the key: the retry must dedupe against a possibly
+                Err(e) if normative => {
+                    // Primary-path recovery per the spec's HEARTBEAT
+                    // GUIDANCE. Classes: timeout/connection error, 5xx, 429,
+                    // ambiguous 2xx → same-key recovery bounded by the
+                    // retry window; any other 4xx → stop and surface
+                    // WITHOUT rotating the idempotency key.
+                    if !is_recoverable_in_field_mode(&e) {
+                        tracing::warn!(
+                            reservation_id = %reservation_id,
+                            error = %e,
+                            "heartbeat extend rejected (non-retryable request/authorization failure); stopping heartbeat without key rotation"
+                        );
+                        break;
+                    }
+                    // current_lead_estimate from the last schema-valid
+                    // response — elapsed rounded up (it is consumed lease).
+                    let lead_now = lead_sample
+                        .map_or(0, |(floor, at)| floor.saturating_sub(ceil_ms(at.elapsed())));
+                    // An unbounded attempt budget (None) admits no provably
+                    // safe retry either: fold it into the negative window.
+                    let window = recovery_window_ms(lead_now, request_timeout_ms, max_rtt_ms)
+                        .unwrap_or(i128::MIN);
+                    // Progress guard: the window must decrease between
+                    // consecutive failures of the same recovery run (it
+                    // decreases exactly when monotonic elapsed grows) — this
+                    // also enforces "one immediate retry at window 0, then
+                    // stop".
+                    if recovery_stalled(window, last_recovery_window) {
+                        tracing::warn!(
+                            reservation_id = %reservation_id,
+                            error = %e,
+                            "heartbeat recovery made no progress between consecutive failures; stopping heartbeat"
+                        );
+                        break;
+                    }
+                    if window < 0 {
+                        tracing::warn!(
+                            reservation_id = %reservation_id,
+                            error = %e,
+                            lead_estimate_ms = lead_now,
+                            "no complete extend retry plus safety margin fits the remaining lease; stopping heartbeat (lease cannot be safely renewed)"
+                        );
+                        break;
+                    }
+                    let retry_delay_ms = if e.status() == Some(429) {
+                        // 429: retry after exactly Retry-After (delta-seconds
+                        // × 1000, parsed overflow-safe by the error layer),
+                        // and only when it fits the retry window — never
+                        // invent an earlier retry that violates throttling.
+                        match e.retry_after().map(ceil_ms) {
+                            Some(ra_ms) if i128::from(ra_ms) <= window => ra_ms,
+                            ra => {
+                                tracing::warn!(
+                                    reservation_id = %reservation_id,
+                                    error = %e,
+                                    retry_after_ms = ?ra,
+                                    "429 Retry-After is missing, invalid, or exceeds the safe retry window; stopping heartbeat (lease cannot be safely renewed)"
+                                );
+                                break;
+                            }
+                        }
+                    } else {
+                        recovery_delay_ms(lead_now, window)
+                    };
+                    // Same key: the retry must dedupe against a possibly
                     // applied-but-lost extension.
                     pending_key = Some(key);
-                    if normative {
-                        // Retry paced by the known remaining lease: the last
-                        // lead floor minus time elapsed since that response.
-                        let lead_now = lead_sample.map_or(0, |(floor, at)| {
-                            floor.saturating_sub(
-                                u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX),
-                            )
-                        });
-                        next_beat = tokio::time::Instant::now()
-                            + Duration::from_millis(remaining_retry_delay_ms(lead_now));
-                    } else {
-                        // Fallback: retry at the current cadence.
-                        next_beat = advance(next_beat, delay);
-                    }
+                    last_recovery_window = Some(window);
+                    next_beat = tokio::time::Instant::now() + Duration::from_millis(retry_delay_ms);
+                    tracing::warn!(
+                        reservation_id = %reservation_id,
+                        error = %e,
+                        retry_delay_ms,
+                        "heartbeat extend failed; retrying with the same idempotency key within the recovery window"
+                    );
+                }
+                Err(e) => {
+                    // Fallback: keep the key (the retry must dedupe against
+                    // a possibly applied-but-lost extension) and retry at
+                    // the current cadence.
+                    pending_key = Some(key);
+                    next_beat = advance(next_beat, delay);
                     tracing::warn!(
                         reservation_id = %reservation_id,
                         error = %e,
@@ -672,33 +906,121 @@ mod tests {
     }
 
     #[test]
-    fn remaining_next_delay_pins() {
-        // Spec pin: remaining 60 s, negligible rtt → reserve =
-        // max(1 s, 2·rtt) = 1 s → next beat 59 s after receipt.
-        assert_eq!(remaining_next_delay_ms(60_000, 0, 0), 59_000);
-        // Slow observed round trips widen the reserve: 2·5000 = 10 s.
-        assert_eq!(remaining_next_delay_ms(60_000, 0, 5_000), 50_000);
-        // rtt shaves the floor first: lead 59 500, reserve 1000.
-        assert_eq!(remaining_next_delay_ms(60_000, 500, 500), 58_500);
-        // Capped-create pin: remaining 1000 → reserve = min(500, 1000) =
-        // 500 → the first beat lands at 500 ms, inside the real 1 s lease.
-        assert_eq!(remaining_next_delay_ms(1_000, 0, 0), 500);
-        // The reserve never exceeds half the floor, however slow the rtts.
-        assert_eq!(remaining_next_delay_ms(1_500, 0, 10_000), 750);
-        // Zero/exhausted lease → beat immediately.
-        assert_eq!(remaining_next_delay_ms(0, 0, 0), 0);
-        assert_eq!(remaining_next_delay_ms(100, 200, 200), 0);
+    fn ceil_ms_rounds_up() {
+        assert_eq!(ceil_ms(Duration::from_millis(5)), 5);
+        assert_eq!(ceil_ms(Duration::from_micros(1)), 1);
+        assert_eq!(ceil_ms(Duration::from_micros(4_001)), 5);
+        assert_eq!(ceil_ms(Duration::ZERO), 0);
     }
 
     #[test]
-    fn remaining_retry_delay_is_quarter_lead_clamped() {
-        // Floor: never a sub-second hammer, even with no lease left.
-        assert_eq!(remaining_retry_delay_ms(0), 1_000);
-        assert_eq!(remaining_retry_delay_ms(997), 1_000);
-        // Quarter of the current lead estimate.
-        assert_eq!(remaining_retry_delay_ms(8_000), 2_000);
-        // Cap: never more than 30 s in the dark.
-        assert_eq!(remaining_retry_delay_ms(1_000_000), 30_000);
+    fn attempt_budget_and_safety_margin_pins() {
+        // Budget: max(request timeout, 1 s, 2·max_rtt) — round up, never
+        // below the 1 s floor.
+        assert_eq!(attempt_budget_ms(Some(500), 0), Some(1_000));
+        assert_eq!(attempt_budget_ms(Some(10_000), 1_500), Some(10_000));
+        assert_eq!(attempt_budget_ms(Some(1_000), 5_000), Some(10_000));
+        // Unknown/unbounded request timeout → positive infinity.
+        assert_eq!(attempt_budget_ms(None, 5_000), None);
+        // Safety margin: max(1 s, 2·max_rtt).
+        assert_eq!(safety_margin_ms(0), 1_000);
+        assert_eq!(safety_margin_ms(400), 1_000);
+        assert_eq!(safety_margin_ms(1_500), 3_000);
+    }
+
+    #[test]
+    fn remaining_next_delay_pins() {
+        // Spec worked example: lead ≈ 60 000, 10 s request timeout, 1.5 s
+        // max rtt → attempt_budget 10 000, safety 3 000, reserve 23 000 →
+        // next_delay 37 000.
+        assert_eq!(
+            remaining_next_delay_ms(60_000, 0, Some(10_000), 1_500),
+            37_000
+        );
+        // Spec worked example: a 30 s timeout makes the reserve ≥ 61 000,
+        // so a 60 000 lead produces 0.
+        assert_eq!(remaining_next_delay_ms(60_000, 0, Some(30_000), 0), 0);
+        // Minimal budgets (small enforced timeout, negligible rtt):
+        // reserve = 2·1000 + 1000 = 3000.
+        assert_eq!(remaining_next_delay_ms(60_000, 0, Some(500), 0), 57_000);
+        assert_eq!(remaining_next_delay_ms(4_000, 0, Some(500), 0), 1_000);
+        assert_eq!(remaining_next_delay_ms(3_000, 0, Some(500), 0), 0);
+        // rtt shaves the lead floor first.
+        assert_eq!(remaining_next_delay_ms(4_000, 500, Some(500), 0), 500);
+        // Unknown/unbounded attempt budget → 0 (never a positive delay).
+        assert_eq!(remaining_next_delay_ms(3_600_000, 0, None, 0), 0);
+        // Zero/exhausted lease → 0, never wraps.
+        assert_eq!(remaining_next_delay_ms(0, 0, Some(500), 0), 0);
+        assert_eq!(remaining_next_delay_ms(100, 200, Some(500), 0), 0);
+    }
+
+    #[test]
+    fn recovery_window_pins() {
+        // window = lead − attempt_budget − safety_margin, signed, unclamped.
+        assert_eq!(recovery_window_ms(2_985, Some(500), 0), Some(985));
+        assert_eq!(recovery_window_ms(2_000, Some(500), 0), Some(0));
+        // Negative window: no complete retry plus margin fits.
+        assert_eq!(recovery_window_ms(1_997, Some(500), 0), Some(-3));
+        assert_eq!(recovery_window_ms(0, Some(500), 0), Some(-2_000));
+        // Slow rtts widen both the budget and the margin.
+        assert_eq!(recovery_window_ms(10_000, Some(1_000), 1_500), Some(4_000));
+        // Unbounded attempt budget → no provably safe retry.
+        assert_eq!(recovery_window_ms(u64::MAX, None, 0), None);
+    }
+
+    #[test]
+    fn recovery_delay_is_min_of_cap_quarter_lead_and_window() {
+        // min(30 s, lead/4, window).
+        assert_eq!(recovery_delay_ms(2_985, 985), 746);
+        assert_eq!(recovery_delay_ms(8_000, 30_000), 2_000);
+        assert_eq!(recovery_delay_ms(400_000, 200_000), 30_000);
+        // Zero window → immediate retry (once; the progress guard stops a
+        // second zero-window failure).
+        assert_eq!(recovery_delay_ms(2_000, 0), 0);
+    }
+
+    #[test]
+    fn recovery_progress_guard() {
+        // First failure of a run: no previous window → proceed.
+        assert!(!recovery_stalled(985, None));
+        assert!(!recovery_stalled(0, None));
+        // Window decreased → progress → proceed.
+        assert!(!recovery_stalled(240, Some(985)));
+        assert!(!recovery_stalled(-3, Some(240)));
+        // Window failed to decrease (coarse clock / zero-time loop) → stop.
+        assert!(recovery_stalled(985, Some(985)));
+        assert!(recovery_stalled(986, Some(985)));
+        // Second failure at a zero window → stop (one immediate retry only).
+        assert!(recovery_stalled(0, Some(0)));
+    }
+
+    #[test]
+    fn field_mode_recoverable_classification() {
+        let api = |status: u16| Error::Api {
+            status,
+            code: None,
+            message: "x".into(),
+            request_id: None,
+            retry_after: None,
+            details: None,
+        };
+        // 5xx and 429 recover with the same key.
+        assert!(is_recoverable_in_field_mode(&api(500)));
+        assert!(is_recoverable_in_field_mode(&api(503)));
+        assert!(is_recoverable_in_field_mode(&api(429)));
+        // Ambiguous 2xx surfaces as Deserialization → recoverable.
+        assert!(is_recoverable_in_field_mode(&Error::Deserialization(
+            serde::de::Error::custom("ambiguous")
+        )));
+        // Other 4xx: stop and surface, no key rotation.
+        assert!(!is_recoverable_in_field_mode(&api(400)));
+        assert!(!is_recoverable_in_field_mode(&api(401)));
+        assert!(!is_recoverable_in_field_mode(&api(403)));
+        assert!(!is_recoverable_in_field_mode(&api(422)));
+        // Non-HTTP oddities are not silently retried either.
+        assert!(!is_recoverable_in_field_mode(&Error::Validation(
+            "x".into()
+        )));
     }
 
     #[test]

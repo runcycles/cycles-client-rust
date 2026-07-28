@@ -48,19 +48,37 @@ the band forever, −2 s per cycle) — so the protocol gained a
 server-authoritative field (spec PR #148): **`remaining_ttl_ms`** on both
 `ReservationCreateResponse` and `ExtendResponse` (int64 ≥ 0, remaining
 lifetime at response evaluation, same clock snapshot as `expires_at_ms`,
-optional in the client models for back-compat). When present, scheduling is
-**normative**: `lead_floor = max(0, remaining − rtt)` (rtt = monotonic
-send→receive elapsed, unknown → 0; max observed rtt tracked per heartbeat),
-`retry_reserve = min(lead_floor/2, max(1 s, 2·max_rtt))`, next beat at
-`lead_floor − retry_reserve` after receipt — recomputed from every
-field-carrying response, never from accumulated expiry differences; the
-`lead_min` skip check is bypassed (exact schedule; a heuristic skip could
-overshoot the real lease) while the ledger keeps running for seamless
-fallback if the field disappears; transient failures retry same-key after
-`clamp(lead_estimate/4, 1 s, 30 s)`; a field-carrying create derives the
-first beat from the same formula instead of the immediate prime (no wasted
-extension under max-lead clamping). The grant-ledger heuristic below is
-retained verbatim as the fallback for servers without the field.
+optional in the client models for back-compat). The final spec-alignment
+pass conformed the client to the settled HEARTBEAT GUIDANCE (spec PR #148
+head `dd60c27`). When present, scheduling is **normative**: only a
+schema-valid HTTP 200 counts as success (other/malformed 2xx = ambiguous →
+same-key transient recovery; new `extend_reservation_strict`);
+`lead_floor = max(0, remaining − rtt)` (rtt = the individual attempt's
+monotonic send→receive elapsed — replays recompute `remaining_ttl_ms`
+server-side, so no earlier attempt's timing is ever substituted),
+`attempt_budget = max(request_timeout_budget, 1 s, 2·max_rtt)` (the
+enforced reqwest per-attempt bound `connect_timeout + read_timeout`;
+unknown/unbounded → infinity → delay 0), `safety_margin = max(1 s,
+2·max_rtt)`, `retry_reserve = 2·attempt_budget + safety_margin`,
+`next_delay = max(0, lead_floor − retry_reserve)` after receipt —
+recomputed from every field-carrying response, never from accumulated
+expiry differences; overflow-safe saturating ms, budgets/margins rounded
+up, leads/delays rounded down (`ceil_ms`); the `lead_min` skip check is
+bypassed while the ledger keeps running for seamless fallback if the field
+disappears. Zero-delay guard: one immediate fresh-key extension after a
+zero-delay success, stop + warn on the second in a row (lease shorter than
+the retry-safety budget). Recovery (timeout/conn/5xx/429/ambiguous 2xx):
+`retry_window = lead_estimate − attempt_budget − safety_margin` (signed);
+negative → stop and surface; else same-key retry after
+`min(30 s, lead_estimate/4, window)`; 429 retries after exactly
+`Retry-After` (delta-seconds × 1000, checked) only when it fits the window,
+else stop; repeated recovery recomputes lead/window from the same last
+schema-valid response after every failure with a progress guard (window
+must decrease); any other 4xx stops without key rotation. A field-carrying
+create derives the first beat from the same formula instead of the
+immediate prime (no wasted extension under max-lead clamping). The
+grant-ledger heuristic below is retained verbatim as the fallback for
+servers without the field.
 **Grant-ledger fallback (v2.3)** design: correctness rests on
 `lead_min = grants_sum − elapsed` (signed, starts 0), a rigorous lower bound
 built only from same-frame arithmetic — each grant is the difference of
@@ -81,25 +99,36 @@ equivalent, hand-rolled for variable delays). Any 2xx counts as applied
 (`expires_at_ms` authoritative, warn on odd status); permanent codes
 (`RESERVATION_EXPIRED`/`RESERVATION_FINALIZED`/`MAX_EXTENSIONS_EXCEEDED`/
 `TENANT_CLOSED`/`NOT_FOUND` or HTTP 410/404) stop the heartbeat.
-Cancellation unchanged. Sixteen wiremock tests with dynamic expiry
+Cancellation unchanged. Twenty-four wiremock tests with dynamic expiry
 responders — fallback: immediate first beat + extend@0/1000/2000,
 skip@3000, extend@4000; capped grant keeping `extend_by_ms` at the request
 while the immediate beat discovers the cap; 503 on the immediate beat →
 single held-cadence retry with the same key; permanent stops; small-ttl
 liveness; per-extend grant clamp still tightening to grant/2; lead-clamp
 echo responder holding cadence instead of collapsing; zero-grant immediate
-prime holding cadence; unknown-status 200 as applied — normative: no prime
-+ `lead_floor − retry_reserve` first beat; skip bypass under accumulating
-grants; capped 1 s lease first-beating at ~500 ms inside the lease;
-field-carrying max-lead clamp at ~cap − reserve with no collapse; field
-disappearing mid-flight → heuristic resuming (with its skip) on the
-ledger maintained through the normative phase; same-key normative retry at
-`clamp(lead/4, 1 s, 30 s)`. Extracted pure scheduling functions
-unit-tested (30 s held-cadence cap, lead-clamp band boundaries, 60 s → 59 s
-normative delay pin, rtt widening/saturation, retry-clamp bounds) in
-`src/heartbeat.rs`; `remaining_ttl_ms` wire-format serde tests in
+prime holding cadence; unknown-status 200 as applied; non-conformant
+reserve without expires_at_ms still heartbeating on the requested-amount
+grant fallback — normative (small enforced timeout → minimal reserve
+3000 ms): no prime + `lead_floor − retry_reserve` first beat with the
+`lead_min` skip bypassed; zero-delay guard (sub-reserve lease → one
+immediate fresh-key extension → stop + warn) and its single-dip recovery
+twin (one zero-delay success → one fresh immediate extension → healthy
+lease resumes the schedule); field-carrying max-lead clamp at
+~cap − reserve with no collapse; field disappearing mid-flight → heuristic
+resuming at grant/2; 503, ambiguous 200 (non-schema body), and ambiguous
+204 (non-200 2xx) recovering same-key inside the window then resuming
+normatively with a fresh key; persistent 500 retrying same-key until the
+recomputed window goes negative, then stopping for good; 429 in-window
+`Retry-After: 0` retried after exactly that (same key) vs. 429 exceeding
+the window stopping without an early retry; 400 stopping with no retry and
+no key rotation. Extracted pure scheduling functions unit-tested (30 s
+held-cadence cap, lead-clamp band boundaries, the spec's worked examples
+60 000/10 000/1 500 → 37 000 and 30 s timeout → 0, budget/margin floors,
+unbounded-budget infinity, signed windows, `min(30 s, lead/4, window)`,
+`ceil_ms` rounding, the recovery progress guard, field-mode
+recoverable/stop classification) in `src/heartbeat.rs`; `remaining_ttl_ms` wire-format serde tests in
 `tests/models_test.rs`; `Date`-parsing unit tests in `src/response.rs`.
-Coverage 95.26%; tests, clippy `-D warnings`, fmt green.
+Coverage 95.05%; tests, clippy `-D warnings`, fmt green.
 
 ## 2026-07-27 — v0.3.0 self-review hardening
 

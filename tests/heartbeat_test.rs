@@ -69,6 +69,10 @@ struct ExpirySequence {
     /// When set with `remaining_ttl_ms`, only the first `n` responses carry
     /// the field — models a mid-flight rollback to a server without it.
     remaining_on_first_n: Option<u64>,
+    /// When set, the FIRST response reports this `remaining_ttl_ms` value
+    /// instead of the constant one — models a one-off short lease (e.g. a
+    /// momentary max-lead dip that triggers the zero-delay guard once).
+    remaining_first: Option<u64>,
     calls: AtomicU64,
 }
 
@@ -81,6 +85,7 @@ impl ExpirySequence {
             rest_status: "ACTIVE",
             remaining_ttl_ms: None,
             remaining_on_first_n: None,
+            remaining_first: None,
             calls: AtomicU64::new(0),
         }
     }
@@ -92,6 +97,11 @@ impl ExpirySequence {
 
     fn remaining_only_on_first(mut self, n: u64) -> Self {
         self.remaining_on_first_n = Some(n);
+        self
+    }
+
+    fn with_first_remaining(mut self, remaining_ttl_ms: u64) -> Self {
+        self.remaining_first = Some(remaining_ttl_ms);
         self
     }
 }
@@ -108,7 +118,12 @@ impl Respond for ExpirySequence {
             "status": status,
             "expires_at_ms": self.base + n * self.step
         });
-        if let Some(remaining) = self.remaining_ttl_ms {
+        let remaining = if n == 1 {
+            self.remaining_first.or(self.remaining_ttl_ms)
+        } else {
+            self.remaining_ttl_ms
+        };
+        if let Some(remaining) = remaining {
             if self.remaining_on_first_n.is_none_or(|first_n| n <= first_n) {
                 body["remaining_ttl_ms"] = json!(remaining);
             }
@@ -742,120 +757,154 @@ async fn heartbeat_2xx_unknown_status_counts_as_applied() {
 }
 
 // ─── Normative scheduling: remaining_ttl_ms (spec PR #148) ───────────────
+//
+// Field-mode numbers used throughout: the client below enforces a small
+// per-attempt timeout (connect 500 ms + read 500 ms → request_timeout_budget
+// 1000 ms) and loopback rtts are negligible, so attempt_budget = 1000 ms,
+// safety_margin = 1000 ms, and retry_reserve = 2·1000 + 1000 = 3000 ms.
+// A response reporting remaining_ttl_ms = R therefore schedules the next
+// beat ≈ R − 3000 ms after receipt.
+
+/// Reserve with a small enforced per-attempt timeout so the normative
+/// recovery reserve is the minimal 3000 ms — keeps field-mode wall-clock
+/// tests fast.
+async fn do_reserve_fast(
+    server: &MockServer,
+    requested_ttl_ms: u64,
+) -> runcycles::ReservationGuard {
+    let client = CyclesClient::builder("key", server.uri())
+        .connect_timeout(Duration::from_millis(500))
+        .read_timeout(Duration::from_millis(500))
+        .build();
+    let req = ReservationCreateRequest::builder()
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::usd_microcents(5000))
+        .ttl_ms(requested_ttl_ms)
+        .build();
+    client.reserve(req).await.unwrap()
+}
 
 /// A field-carrying server drives the schedule exactly: create reports
-/// `remaining_ttl_ms = 2000`, so the first beat lands at
+/// `remaining_ttl_ms = 4000`, so the first beat lands at
 /// `lead_floor − retry_reserve ≈ 1000 ms` — NOT immediately (no primed
-/// extension is spent) — and each extend reporting 2000 re-schedules
-/// ~1000 ms after receipt. The responses also grant +2000 of expiry per
-/// extend, so the background ledger accumulates enough lead that the
-/// heuristic would skip beat 4 — the bypassed skip check must extend
-/// every beat instead.
+/// extension) and well inside the real 4 s lease — and each extend
+/// reporting 4000 re-schedules ~1000 ms after receipt. The responses also
+/// grant +4000 of expiry per extend, so the background ledger accumulates
+/// enough lead that the heuristic would skip beat 4 — the bypassed skip
+/// check must extend every beat instead. The wire `extend_by_ms` stays the
+/// requested 8000 (`extend_bodies` asserts).
 #[tokio::test]
 async fn heartbeat_remaining_ttl_schedules_normatively_and_bypasses_skip() {
     let server = MockServer::start().await;
     let rsv_id = "rsv_hb_norm";
-    const TTL: u64 = 2_000;
+    const REQUESTED: u64 = 8_000;
+    const REMAINING: u64 = 4_000;
     const BEAT: Duration = Duration::from_millis(1_000);
 
-    mount_reserve_full(&server, rsv_id, initial_expiry(TTL), Some(TTL)).await;
+    mount_reserve_full(&server, rsv_id, initial_expiry(REMAINING), Some(REMAINING)).await;
     Mock::given(method("POST"))
         .and(path(extend_path(rsv_id)))
-        .respond_with(ExpirySequence::granting(initial_expiry(TTL), TTL).with_remaining(TTL))
+        .respond_with(
+            ExpirySequence::granting(initial_expiry(REMAINING), REMAINING)
+                .with_remaining(REMAINING),
+        )
         .mount(&server)
         .await;
 
-    let guard = do_reserve(&server, TTL).await;
+    let guard = do_reserve_fast(&server, REQUESTED).await;
 
     tokio::time::sleep(MARGIN).await;
     assert_eq!(
-        extend_calls(&server, rsv_id, TTL).await,
+        extend_calls(&server, rsv_id, REQUESTED).await,
         0,
         "with remaining_ttl_ms on the create response there is no immediate \
          primed extension — the first beat is scheduled normatively at \
-         ~1000 ms"
+         lead_floor − retry_reserve ≈ 1000 ms"
     );
 
     tokio::time::sleep(BEAT).await;
     assert_eq!(
-        extend_calls(&server, rsv_id, TTL).await,
+        extend_calls(&server, rsv_id, REQUESTED).await,
         1,
-        "beat 1 lands at lead_floor − retry_reserve ≈ 1000 ms"
+        "beat 1 lands ≈ 1000 ms — inside the real 4 s lease (a requested/2 \
+         = 4 s schedule would have been at its very end)"
     );
 
-    // Extra 250 ms of slack: normative beats schedule from response
-    // receipt, so per-beat rtt accumulates (late-only drift).
-    tokio::time::sleep(BEAT + BEAT + BEAT + Duration::from_millis(250)).await;
+    tokio::time::sleep(BEAT + BEAT).await;
     assert_eq!(
-        extend_calls(&server, rsv_id, TTL).await,
+        extend_calls(&server, rsv_id, REQUESTED).await,
+        3,
+        "normative beats every ≈ 1000 ms"
+    );
+
+    tokio::time::sleep(BEAT).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, REQUESTED).await,
         4,
-        "normative mode extends every ~1000 ms beat — the lead_min heuristic \
-         (which would have skipped beat 4 on the accumulated +2000 grants) \
-         must be bypassed"
+        "beat 4 must extend — the lead_min heuristic (which would skip here \
+         on the accumulated +4000 grants) must be bypassed in field mode"
     );
 
     guard.release("test done").await.unwrap();
 }
 
-/// Tenant policy caps the lease to 1 s and the create response says so:
-/// `remaining_ttl_ms = 1000` puts the first beat at 500 ms — inside the
-/// real lease, with no primed extension and no heuristics.
+/// Zero-delay guard: a lease shorter than the retry-safety reserve
+/// (remaining 2500 < 3000) yields next_delay = 0 from the create — ONE
+/// immediate fresh-key extension is permitted; when its response reports
+/// the same short lease (next_delay = 0 again), the heartbeat stops and
+/// surfaces that the lease is shorter than its retry-safety budget, rather
+/// than burning a maximum-lead server's extension budget in a tight loop.
 #[tokio::test]
-async fn heartbeat_remaining_ttl_capped_create_first_beat_inside_lease() {
+async fn heartbeat_remaining_ttl_zero_delay_guard_stops_after_one_fresh_attempt() {
     let server = MockServer::start().await;
-    let rsv_id = "rsv_hb_norm_cap";
+    let rsv_id = "rsv_hb_norm_zero";
     const REQUESTED: u64 = 8_000;
-    const GRANTED: u64 = 1_000;
+    const REMAINING: u64 = 2_500;
 
-    mount_reserve_full(&server, rsv_id, initial_expiry(GRANTED), Some(GRANTED)).await;
+    mount_reserve_full(&server, rsv_id, initial_expiry(REMAINING), Some(REMAINING)).await;
     Mock::given(method("POST"))
         .and(path(extend_path(rsv_id)))
         .respond_with(
-            ExpirySequence::granting(initial_expiry(GRANTED), GRANTED).with_remaining(GRANTED),
+            ExpirySequence::granting(initial_expiry(REMAINING), REMAINING)
+                .with_remaining(REMAINING),
         )
         .mount(&server)
         .await;
 
-    let guard = do_reserve(&server, REQUESTED).await;
+    let guard = do_reserve_fast(&server, REQUESTED).await;
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        extend_calls(&server, rsv_id, REQUESTED).await,
-        0,
-        "no immediate prime: the first beat is scheduled at \
-         reserve = min(lead/2, 1 s) = ~500 ms"
-    );
-
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep(MARGIN).await;
     assert_eq!(
         extend_calls(&server, rsv_id, REQUESTED).await,
         1,
-        "the first beat lands at ~500 ms — inside the real 1 s lease"
+        "next_delay = 0 from the create permits exactly one immediate \
+         fresh-key extension"
     );
 
-    // Receipt-based ~500 ms cadence with per-beat rtt drift: 2-3 extends
-    // by ~1.45 s, where the requested/2 = 4 s schedule would still show 0
-    // extends after the first.
-    tokio::time::sleep(Duration::from_millis(550)).await;
-    let count = extend_calls(&server, rsv_id, REQUESTED).await;
-    assert!(
-        (2..=3).contains(&count),
-        "each 1 s remaining_ttl_ms re-schedules ~500 ms after receipt \
-         (got {count} by ~1.45 s)"
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, REQUESTED).await,
+        1,
+        "a second zero-delay success must stop the heartbeat (lease shorter \
+         than the retry-safety budget) — no tight extension loop"
     );
 
     guard.release("test done").await.unwrap();
 }
 
 /// A maximum-LEAD-clamping server that reports `remaining_ttl_ms` needs no
-/// heuristics at all: every response says ~cap remains, so beats land at
-/// `cap − retry_reserve ≈ 2000 ms` — no cadence collapse to the 500 ms
-/// floor, no lead-clamp regime, and no wasted primed first extension.
+/// heuristics: every response says ~5000 ms remains, so beats land at
+/// `5000 − 3000 ≈ 2000 ms` — no cadence collapse to the 500 ms floor, no
+/// lead-clamp regime, and no wasted primed first extension.
 #[tokio::test]
 async fn heartbeat_remaining_ttl_under_max_lead_clamp() {
     let server = MockServer::start().await;
     let rsv_id = "rsv_hb_norm_clamp";
-    const TTL: u64 = 3_000;
+    const TTL: u64 = 5_000;
 
     mount_reserve_full(&server, rsv_id, initial_expiry(TTL), Some(TTL)).await;
     Mock::given(method("POST"))
@@ -864,28 +913,28 @@ async fn heartbeat_remaining_ttl_under_max_lead_clamp() {
         .mount(&server)
         .await;
 
-    let guard = do_reserve(&server, TTL).await;
+    let guard = do_reserve_fast(&server, TTL).await;
 
     tokio::time::sleep(MARGIN).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
         0,
         "no primed extension under a max-lead clamp when the create reports \
-         remaining_ttl_ms — the first beat waits ~2000 ms"
+         remaining_ttl_ms — the first beat waits ≈ 2000 ms"
     );
 
     tokio::time::sleep(Duration::from_millis(2_000)).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
         1,
-        "beat 1 at remaining − reserve ≈ 2000 ms"
+        "beat 1 at remaining − retry_reserve ≈ 2000 ms"
     );
 
     tokio::time::sleep(Duration::from_millis(2_000)).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
         2,
-        "steady ~2000 ms cadence from the reported remaining lease — never \
+        "steady ≈ 2000 ms cadence from the reported remaining lease — never \
          a collapse to the 500 ms floor"
     );
 
@@ -894,78 +943,72 @@ async fn heartbeat_remaining_ttl_under_max_lead_clamp() {
 
 /// The field disappears mid-flight (rollback / mixed fleet): only the
 /// create and the first extend carry `remaining_ttl_ms`. The heartbeat must
-/// resume the grant-ledger heuristic seamlessly — and because the ledger
-/// was maintained during the normative phase, the heuristic's skip fires at
-/// the right beat.
+/// resume the grant-ledger heuristic seamlessly at the observed grant/2
+/// cadence.
 #[tokio::test]
 async fn heartbeat_remaining_ttl_disappearing_falls_back_to_heuristic() {
     let server = MockServer::start().await;
     let rsv_id = "rsv_hb_norm_gone";
-    const TTL: u64 = 1_200;
+    const REQUESTED: u64 = 1_200;
+    const REMAINING: u64 = 4_000;
 
-    mount_reserve_full(&server, rsv_id, initial_expiry(TTL), Some(TTL)).await;
-    // Only the FIRST extend response carries the field; the rest are bare.
+    mount_reserve_full(&server, rsv_id, initial_expiry(REMAINING), Some(REMAINING)).await;
+    // Only the FIRST extend response carries the field; the rest are bare
+    // and grant +1200 (the requested ttl) of expiry each.
     Mock::given(method("POST"))
         .and(path(extend_path(rsv_id)))
         .respond_with(
-            ExpirySequence::granting(initial_expiry(TTL), TTL)
-                .with_remaining(TTL)
+            ExpirySequence::granting(initial_expiry(REMAINING), REQUESTED)
+                .with_remaining(REMAINING)
                 .remaining_only_on_first(1),
         )
         .mount(&server)
         .await;
 
-    let guard = do_reserve(&server, TTL).await;
+    let guard = do_reserve_fast(&server, REQUESTED).await;
 
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
-        extend_calls(&server, rsv_id, TTL).await,
+        extend_calls(&server, rsv_id, REQUESTED).await,
         0,
-        "normative first beat: no immediate prime"
+        "normative first beat (≈ 1000 ms): no immediate prime"
     );
 
-    // Normative: b1 ≈ 600 ms (lead 1200, reserve = lead/2). Its response
-    // carries the field → b2 ≈ 1200 ms.
     tokio::time::sleep(Duration::from_millis(1_200)).await;
-    let early = extend_calls(&server, rsv_id, TTL).await;
-    assert!(
-        (1..=2).contains(&early),
-        "normative beats at ~600/1200 ms (got {early} by 1450 ms)"
+    assert_eq!(
+        extend_calls(&server, rsv_id, REQUESTED).await,
+        1,
+        "beat 1 lands normatively at ≈ 1000 ms"
     );
 
-    // b2's response is BARE → the heuristic resumes: grant 1200 =
-    // requested → 600 ms cadence, beats at ~1800/2400/3000 ms; the ledger
-    // (maintained through the normative phase, 1200 per extend) reaches
-    // lead_min ≥ 1.5·grant at 3600 ms, so that beat is the heuristic skip
-    // and the next extend cannot land before ~4200 ms. Exactly 5 extends
-    // by 4050 ms therefore pins BOTH properties: the resumed 600 ms
-    // cadence (a held/normative ~600 ms→∞ mismatch would give fewer) and
-    // the skip (a skip-less 600 ms cadence would already show 6).
-    tokio::time::sleep(Duration::from_millis(2_600)).await;
+    // b1's response still carries the field → b2 ≈ 2000 ms. b2's response
+    // is BARE → the heuristic resumes: grant 1200 = requested → 600 ms
+    // cadence → beats ≈ 2600 and 3200 ms.
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
     assert_eq!(
-        extend_calls(&server, rsv_id, TTL).await,
-        5,
-        "after the field disappears the heuristic must resume at the \
-         observed 600 ms cadence AND skip at ~3600 ms on the ledger \
-         maintained during the normative phase"
+        extend_calls(&server, rsv_id, REQUESTED).await,
+        4,
+        "after the field disappears the heuristic resumes at the observed \
+         grant/2 = 600 ms cadence (beats ≈ 2000/2600/3200 ms)"
     );
 
     guard.release("test done").await.unwrap();
 }
 
-/// A transient failure in normative mode retries with the SAME idempotency
-/// key after `clamp(lead_estimate/4, 1 s, 30 s)` — here lead ≈ 1000 at the
-/// failed ~1000 ms beat, so the retry lands ~1 s later; after the retry
-/// succeeds the next beat uses a fresh key.
+/// A transient failure (503) in field mode retries with the SAME
+/// idempotency key after `min(30 s, lead_estimate/4, retry_window)` — here
+/// lead ≈ 3000 at the failed ≈ 2000 ms beat, window ≈ 1000, so the retry
+/// lands ≈ 750 ms later; the window-bounded recovery then resumes the
+/// normative schedule.
 #[tokio::test]
 async fn heartbeat_remaining_ttl_transient_failure_retries_same_key() {
     let server = MockServer::start().await;
     let rsv_id = "rsv_hb_norm_retry";
-    const TTL: u64 = 2_000;
-    const BEAT: Duration = Duration::from_millis(1_000);
+    const REQUESTED: u64 = 8_000;
+    const REMAINING: u64 = 5_000;
 
-    mount_reserve_full(&server, rsv_id, initial_expiry(TTL), Some(TTL)).await;
-    // The first extend attempt (normatively scheduled at ~1000 ms) fails...
+    mount_reserve_full(&server, rsv_id, initial_expiry(REMAINING), Some(REMAINING)).await;
+    // The first extend attempt (normatively scheduled at ≈ 2000 ms) fails...
     Mock::given(method("POST"))
         .and(path(extend_path(rsv_id)))
         .respond_with(ResponseTemplate::new(503).set_body_json(json!({
@@ -978,42 +1021,451 @@ async fn heartbeat_remaining_ttl_transient_failure_retries_same_key() {
     // ...subsequent attempts succeed, still carrying the field.
     Mock::given(method("POST"))
         .and(path(extend_path(rsv_id)))
-        .respond_with(ExpirySequence::granting(initial_expiry(TTL), TTL).with_remaining(TTL))
+        .respond_with(
+            ExpirySequence::granting(initial_expiry(REMAINING), REMAINING)
+                .with_remaining(REMAINING),
+        )
+        .mount(&server)
+        .await;
+
+    let guard = do_reserve_fast(&server, REQUESTED).await;
+
+    tokio::time::sleep(Duration::from_millis(2_450)).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, REQUESTED).await,
+        1,
+        "the normative first beat at ≈ 2000 ms attempts and fails"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let bodies = extend_bodies(&server, rsv_id, REQUESTED).await;
+    assert_eq!(
+        bodies.len(),
+        2,
+        "the retry lands min(30 s, lead/4, window) ≈ 750 ms after the failure"
+    );
+    assert_eq!(
+        bodies[0]["idempotency_key"], bodies[1]["idempotency_key"],
+        "the field-mode recovery retry must reuse the failed attempt's \
+         idempotency key"
+    );
+
+    guard.release("test done").await.unwrap();
+}
+
+/// An ambiguous 2xx (an HTTP 200 whose body is not a schema-valid
+/// ReservationExtendResponse) is NOT a success in field mode: it is
+/// recovered exactly like a transient failure — same idempotency key,
+/// window-bounded delay — and the next schema-valid success resumes the
+/// normative schedule with a fresh key.
+#[tokio::test]
+async fn heartbeat_remaining_ttl_ambiguous_2xx_recovers_with_same_key() {
+    let server = MockServer::start().await;
+    let rsv_id = "rsv_hb_norm_ambig";
+    const REQUESTED: u64 = 8_000;
+    const REMAINING: u64 = 5_000;
+
+    mount_reserve_full(&server, rsv_id, initial_expiry(REMAINING), Some(REMAINING)).await;
+    // The first extend gets an HTTP 200 that is not a schema-valid
+    // ReservationExtendResponse...
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json at all"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // ...subsequent attempts are schema-valid.
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(
+            ExpirySequence::granting(initial_expiry(REMAINING), REMAINING)
+                .with_remaining(REMAINING),
+        )
+        .mount(&server)
+        .await;
+
+    let guard = do_reserve_fast(&server, REQUESTED).await;
+
+    tokio::time::sleep(Duration::from_millis(2_450)).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, REQUESTED).await,
+        1,
+        "the ambiguous 200 must not count as success — one attempt so far, \
+         recovery pending"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let bodies = extend_bodies(&server, rsv_id, REQUESTED).await;
+    assert_eq!(
+        bodies.len(),
+        2,
+        "the ambiguous 2xx is recovered like a transient failure ≈ 750 ms later"
+    );
+    assert_eq!(
+        bodies[0]["idempotency_key"], bodies[1]["idempotency_key"],
+        "ambiguous-2xx recovery must reuse the same idempotency key (the \
+         extension may have been applied)"
+    );
+
+    // The schema-valid retry response resumed the normative schedule:
+    // next beat ≈ 2000 ms after it, with a FRESH key.
+    tokio::time::sleep(Duration::from_millis(1_800)).await;
+    let bodies = extend_bodies(&server, rsv_id, REQUESTED).await;
+    assert_eq!(bodies.len(), 3, "normative schedule resumes after recovery");
+    assert_ne!(
+        bodies[2]["idempotency_key"], bodies[0]["idempotency_key"],
+        "after a schema-valid success the next extend uses a fresh key"
+    );
+
+    guard.release("test done").await.unwrap();
+}
+
+/// Repeated recovery is window-bounded: with the server persistently
+/// failing (500), the client recomputes lead/window from the same last
+/// schema-valid response after every failure and keeps retrying the same
+/// key while the window is non-negative — then stops for good once no
+/// complete retry plus margin fits.
+#[tokio::test]
+async fn heartbeat_remaining_ttl_recovery_stops_when_window_exhausted() {
+    let server = MockServer::start().await;
+    let rsv_id = "rsv_hb_norm_exhaust";
+    const REQUESTED: u64 = 8_000;
+    const REMAINING: u64 = 5_000;
+
+    mount_reserve_full(&server, rsv_id, initial_expiry(REMAINING), Some(REMAINING)).await;
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": "INTERNAL_ERROR",
+            "message": "down"
+        })))
+        .mount(&server)
+        .await;
+
+    let guard = do_reserve_fast(&server, REQUESTED).await;
+
+    // First attempt ≈ 2000 ms (window ≈ 990 → retry ≈ +750), second ≈
+    // 2750 ms (window ≈ 240 → retry ≈ +240), third ≈ 3000 ms (window < 0 →
+    // stop). Allow jitter: 3-5 attempts, all with the SAME key.
+    tokio::time::sleep(Duration::from_millis(4_200)).await;
+    let bodies = extend_bodies(&server, rsv_id, REQUESTED).await;
+    let n = bodies.len();
+    assert!(
+        (3..=5).contains(&n),
+        "recovery must retry while the window is non-negative and then stop \
+         (expected 3-5 attempts, got {n})"
+    );
+    for body in &bodies {
+        assert_eq!(
+            body["idempotency_key"], bodies[0]["idempotency_key"],
+            "every recovery retry must reuse the original idempotency key"
+        );
+    }
+
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, REQUESTED).await,
+        n,
+        "once retry_window went negative the heartbeat must stop for good"
+    );
+
+    guard.release("test done").await.unwrap();
+}
+
+/// A 429 whose Retry-After fits the retry window is retried after exactly
+/// that delay (delta-seconds × 1000) with the same idempotency key.
+#[tokio::test]
+async fn heartbeat_remaining_ttl_429_retry_after_within_window() {
+    let server = MockServer::start().await;
+    let rsv_id = "rsv_hb_norm_429ok";
+    const REQUESTED: u64 = 8_000;
+    const REMAINING: u64 = 5_000;
+
+    mount_reserve_full(&server, rsv_id, initial_expiry(REMAINING), Some(REMAINING)).await;
+    // Retry-After: 0 → retry_after_ms = 0 ≤ window (≈ 990) → immediate
+    // same-key retry. (A whole-second value cannot fit the ≈ 990 ms window
+    // here — the exceeding case is pinned in the next test.)
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "0")
+                .set_body_json(json!({
+                    "error": "LIMIT_EXCEEDED",
+                    "message": "slow down"
+                })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(
+            ExpirySequence::granting(initial_expiry(REMAINING), REMAINING)
+                .with_remaining(REMAINING),
+        )
+        .mount(&server)
+        .await;
+
+    let guard = do_reserve_fast(&server, REQUESTED).await;
+
+    tokio::time::sleep(Duration::from_millis(2_450)).await;
+    let bodies = extend_bodies(&server, rsv_id, REQUESTED).await;
+    assert_eq!(
+        bodies.len(),
+        2,
+        "the in-window 429 must be retried after exactly Retry-After (0 s → \
+         immediately)"
+    );
+    assert_eq!(
+        bodies[0]["idempotency_key"], bodies[1]["idempotency_key"],
+        "the 429 retry must reuse the same idempotency key"
+    );
+
+    guard.release("test done").await.unwrap();
+}
+
+/// A 429 whose Retry-After exceeds the retry window must NOT be retried
+/// earlier than the server allows — the client stops and surfaces that the
+/// lease cannot be safely renewed.
+#[tokio::test]
+async fn heartbeat_remaining_ttl_429_retry_after_exceeding_window_stops() {
+    let server = MockServer::start().await;
+    let rsv_id = "rsv_hb_norm_429no";
+    const REQUESTED: u64 = 8_000;
+    const REMAINING: u64 = 5_000;
+
+    mount_reserve_full(&server, rsv_id, initial_expiry(REMAINING), Some(REMAINING)).await;
+    // Retry-After: 1 → 1000 ms, strictly above the ≈ 990 ms window at the
+    // first beat (the beat spends the lease down to the 3000 ms reserve and
+    // the attempt itself consumes more, so window < 1000 deterministically).
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "1")
+                .set_body_json(json!({
+                    "error": "LIMIT_EXCEEDED",
+                    "message": "slow down"
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let guard = do_reserve_fast(&server, REQUESTED).await;
+
+    tokio::time::sleep(Duration::from_millis(2_450)).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, REQUESTED).await,
+        1,
+        "the 429 at the first beat is received once"
+    );
+
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, REQUESTED).await,
+        1,
+        "Retry-After exceeding the retry window must stop the heartbeat — \
+         never an earlier retry that violates throttling"
+    );
+
+    guard.release("test done").await.unwrap();
+}
+
+/// Any other 4xx in field mode (here 400) stops the heartbeat immediately:
+/// no retry, and in particular no idempotency-key rotation to force an
+/// unchanged request through.
+#[tokio::test]
+async fn heartbeat_remaining_ttl_other_4xx_stops_without_retry() {
+    let server = MockServer::start().await;
+    let rsv_id = "rsv_hb_norm_4xx";
+    const REQUESTED: u64 = 8_000;
+    const REMAINING: u64 = 5_000;
+
+    mount_reserve_full(&server, rsv_id, initial_expiry(REMAINING), Some(REMAINING)).await;
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "INVALID_REQUEST",
+            "message": "bad"
+        })))
+        .mount(&server)
+        .await;
+
+    let guard = do_reserve_fast(&server, REQUESTED).await;
+
+    tokio::time::sleep(Duration::from_millis(2_450)).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, REQUESTED).await,
+        1,
+        "the 400 at the first beat is received once"
+    );
+
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, REQUESTED).await,
+        1,
+        "another 4xx must stop the heartbeat without key rotation or retry"
+    );
+
+    guard.release("test done").await.unwrap();
+}
+
+/// A non-200 2xx (here 204) is equally ambiguous in field mode — it cannot
+/// be used to schedule from — and is recovered like a transient failure
+/// with the same idempotency key.
+#[tokio::test]
+async fn heartbeat_remaining_ttl_non_200_2xx_is_ambiguous() {
+    let server = MockServer::start().await;
+    let rsv_id = "rsv_hb_norm_204";
+    const REQUESTED: u64 = 8_000;
+    const REMAINING: u64 = 5_000;
+
+    mount_reserve_full(&server, rsv_id, initial_expiry(REMAINING), Some(REMAINING)).await;
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(ResponseTemplate::new(204))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(
+            ExpirySequence::granting(initial_expiry(REMAINING), REMAINING)
+                .with_remaining(REMAINING),
+        )
+        .mount(&server)
+        .await;
+
+    let guard = do_reserve_fast(&server, REQUESTED).await;
+
+    tokio::time::sleep(Duration::from_millis(2_450)).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, REQUESTED).await,
+        1,
+        "the 204 must not count as success — one attempt so far, recovery pending"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let bodies = extend_bodies(&server, rsv_id, REQUESTED).await;
+    assert_eq!(
+        bodies.len(),
+        2,
+        "the ambiguous non-200 2xx is recovered like a transient failure"
+    );
+    assert_eq!(
+        bodies[0]["idempotency_key"], bodies[1]["idempotency_key"],
+        "ambiguous-2xx recovery must reuse the same idempotency key"
+    );
+
+    guard.release("test done").await.unwrap();
+}
+
+/// A SINGLE zero-delay success (a momentary short lease) does not stop the
+/// heartbeat: it permits one immediate extension with a FRESH key, and when
+/// that response reports a healthy lease the normative schedule resumes.
+#[tokio::test]
+async fn heartbeat_remaining_ttl_single_zero_delay_recovers() {
+    let server = MockServer::start().await;
+    let rsv_id = "rsv_hb_norm_zero1";
+    const REQUESTED: u64 = 8_000;
+    const REMAINING: u64 = 5_000;
+
+    mount_reserve_full(&server, rsv_id, initial_expiry(REMAINING), Some(REMAINING)).await;
+    // The first extend response reports a lease below the 3000 ms reserve
+    // (→ next_delay 0, zero-delay streak 1); the immediate follow-up and
+    // all later responses report the healthy 5000 ms lease again.
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(
+            ExpirySequence::granting(initial_expiry(REMAINING), REMAINING)
+                .with_remaining(REMAINING)
+                .with_first_remaining(2_500),
+        )
+        .mount(&server)
+        .await;
+
+    let guard = do_reserve_fast(&server, REQUESTED).await;
+
+    // Beat 1 ≈ 2000 ms reports remaining 2500 → next_delay 0 → ONE
+    // immediate extension follows at once.
+    tokio::time::sleep(Duration::from_millis(2_450)).await;
+    let bodies = extend_bodies(&server, rsv_id, REQUESTED).await;
+    assert_eq!(
+        bodies.len(),
+        2,
+        "a single zero-delay success must be followed by exactly one \
+         immediate extension"
+    );
+    assert_ne!(
+        bodies[0]["idempotency_key"], bodies[1]["idempotency_key"],
+        "the immediate zero-delay extension is a FRESH attempt, not a \
+         same-key retry (the previous extend succeeded)"
+    );
+
+    // Its healthy response (remaining 5000) resumed the ≈ 2000 ms schedule
+    // — no stop, and no tight loop.
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    assert_eq!(
+        extend_calls(&server, rsv_id, REQUESTED).await,
+        3,
+        "a healthy lease after a single zero-delay success resumes the \
+         normative schedule (no stop, no tight loop)"
+    );
+
+    guard.release("test done").await.unwrap();
+}
+
+/// Fallback robustness: a non-conformant reserve response WITHOUT
+/// expires_at_ms (and without remaining_ttl_ms) still gets a working
+/// heartbeat — the immediate prime fires, the unmeasurable first grant
+/// falls back to the requested amount, and the cadence follows from there.
+#[tokio::test]
+async fn heartbeat_fallback_nonconformant_reserve_without_expiry() {
+    let server = MockServer::start().await;
+    let rsv_id = "rsv_hb_noexpiry";
+    const TTL: u64 = 2_000;
+
+    // Reserve response with NO expires_at_ms (non-conformant server).
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "decision": "ALLOW",
+            "reservation_id": rsv_id,
+            "affected_scopes": ["tenant:acme"]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/reservations/{rsv_id}/release")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "RELEASED",
+            "released": {"unit": "USD_MICROCENTS", "amount": 5000}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(ExpirySequence::granting(initial_expiry(TTL), TTL))
         .mount(&server)
         .await;
 
     let guard = do_reserve(&server, TTL).await;
 
-    tokio::time::sleep(MARGIN + BEAT).await;
+    tokio::time::sleep(MARGIN).await;
     assert_eq!(
         extend_calls(&server, rsv_id, TTL).await,
         1,
-        "the normative first beat at ~1000 ms attempts and fails"
+        "the fallback immediate prime fires even without an initial expiry \
+         sample (first grant falls back to the requested amount)"
     );
 
-    tokio::time::sleep(BEAT).await;
-    let bodies = extend_bodies(&server, rsv_id, TTL).await;
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
     assert_eq!(
-        bodies.len(),
+        extend_calls(&server, rsv_id, TTL).await,
         2,
-        "the retry lands clamp(lead/4, 1 s, 30 s) = ~1 s after the failure"
-    );
-    assert_eq!(
-        bodies[0]["idempotency_key"], bodies[1]["idempotency_key"],
-        "the normative-mode retry must reuse the failed attempt's \
-         idempotency key"
-    );
-
-    tokio::time::sleep(BEAT).await;
-    let bodies = extend_bodies(&server, rsv_id, TTL).await;
-    assert_eq!(
-        bodies.len(),
-        3,
-        "the next normative beat follows ~1 s later"
-    );
-    assert_ne!(
-        bodies[2]["idempotency_key"], bodies[0]["idempotency_key"],
-        "after the retry succeeds the next extend uses a fresh key"
+        "the requested-amount fallback grant paces the cadence at \
+         requested/2 = 1000 ms"
     );
 
     guard.release("test done").await.unwrap();
