@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use crate::config::CyclesConfig;
 use crate::models::{CommitRequest, EventCreateRequest};
@@ -122,11 +122,20 @@ impl CommitJournal {
     }
 
     pub(crate) fn discard(&self, reservation_id: &str) -> Result<(), String> {
-        match fs::remove_file(self.path_for(reservation_id)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.to_string()),
+        remove_if_exists(&self.path_for(reservation_id))?;
+        let legacy = self.legacy_path_for(reservation_id);
+        if legacy.exists() {
+            // Legacy sanitization was collision-prone. Delete only when the
+            // record itself proves it belongs to the requested identifier.
+            if let Ok(raw) = fs::read_to_string(&legacy) {
+                if let Ok(record) = serde_json::from_str::<PendingCommitRecord>(&raw) {
+                    if record.validate().is_ok() && record.reservation_id == reservation_id {
+                        remove_if_exists(&legacy)?;
+                    }
+                }
+            }
         }
+        Ok(())
     }
 
     pub(crate) fn load_pending(&self, base_url: &str) -> Vec<PendingCommitRecord> {
@@ -163,8 +172,14 @@ impl CommitJournal {
                     record.validate()?;
                     Ok(record)
                 }) {
-                Ok(record) if record.base_url == base_url => records.push(record),
-                Ok(_) => {}
+                Ok(record) => {
+                    if self.migrate_legacy_path(&path, &record) {
+                        continue;
+                    }
+                    if record.base_url == base_url {
+                        records.push(record);
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(
                         path = %path.display(),
@@ -187,6 +202,12 @@ impl CommitJournal {
     }
 
     fn path_for(&self, reservation_id: &str) -> PathBuf {
+        let digest = Sha256::digest(reservation_id.as_bytes());
+        self.directory
+            .join(format!("v2-{digest:x}{JOURNAL_SUFFIX}"))
+    }
+
+    fn legacy_path_for(&self, reservation_id: &str) -> PathBuf {
         let sanitized = reservation_id
             .chars()
             .map(|character| {
@@ -198,6 +219,52 @@ impl CommitJournal {
             })
             .collect::<String>();
         self.directory.join(format!("{sanitized}{JOURNAL_SUFFIX}"))
+    }
+
+    /// Returns true when `source` duplicated an existing standard record.
+    fn migrate_legacy_path(&self, source: &Path, record: &PendingCommitRecord) -> bool {
+        let standard = self.path_for(&record.reservation_id);
+        if source == standard {
+            return false;
+        }
+        let mut duplicate_of_standard = false;
+        let result = if standard.exists() {
+            fs::read_to_string(&standard)
+                .map_err(|error| error.to_string())
+                .and_then(|raw| {
+                    serde_json::from_str::<PendingCommitRecord>(&raw)
+                        .map_err(|error| error.to_string())
+                })
+                .and_then(|existing| existing.validate().map(|_| existing))
+                .and_then(|existing| {
+                    if existing.reservation_id == record.reservation_id {
+                        remove_if_exists(source)?;
+                        duplicate_of_standard = true;
+                        Ok(())
+                    } else {
+                        Err("standard filename contains a different reservation".to_string())
+                    }
+                })
+        } else {
+            fs::rename(source, &standard).map_err(|error| error.to_string())
+        };
+        if let Err(error) = result {
+            tracing::warn!(
+                reservation_id = %record.reservation_id,
+                path = %source.display(),
+                error = %error,
+                "could not safely migrate legacy journal filename"
+            );
+        }
+        duplicate_of_standard
+    }
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -332,7 +399,7 @@ mod tests {
         let record = pending("rsv/a");
         journal.record(&record).unwrap();
 
-        let path = journal.directory.join("rsv_a.json");
+        let path = journal.path_for("rsv/a");
         let value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["version"], 1);
@@ -346,6 +413,32 @@ mod tests {
         assert_eq!(loaded[0].reservation_id, "rsv/a");
         journal.discard("rsv/a").unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn digest_names_do_not_collide_and_legacy_discard_checks_record_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = CommitJournal {
+            directory: temp.path().join("journal"),
+        };
+        journal.record(&pending("rsv/a")).unwrap();
+        journal.record(&pending("rsv_a")).unwrap();
+        assert_ne!(journal.path_for("rsv/a"), journal.path_for("rsv_a"));
+        assert!(journal.path_for("rsv/a").exists());
+        assert!(journal.path_for("rsv_a").exists());
+
+        let legacy = journal.legacy_path_for("rsv/a");
+        fs::write(&legacy, serde_json::to_string(&pending("rsv/a")).unwrap()).unwrap();
+        journal.discard("rsv_a").unwrap();
+        assert!(legacy.exists());
+        let loaded = journal.load_pending("http://localhost");
+        assert!(!legacy.exists());
+        assert!(journal.path_for("rsv/a").exists());
+        let ids = loaded
+            .iter()
+            .map(|record| record.reservation_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["rsv/a"]);
     }
 
     #[test]

@@ -19,6 +19,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   rotation, no credential is stored, Unix directories/files are restricted to
   `0700`/`0600`, malformed records are quarantined, and concurrent replay is
   safe through the stored idempotency key.
+- Journal filenames use `v2-<sha256(exact UTF-8 reservation id)>.json`, safely
+  migrate matching legacy records, and preserve collision-free cross-SDK
+  replay.
 - Automatic replay starts when an async client is constructed inside Tokio;
   the blocking client owns a worker that starts replay without blocking its
   constructor. Both clients expose `flush_pending_commits` and bounded
@@ -39,6 +42,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `not_before_ms`, so restarting mid-wait cannot violate `Retry-After`.
 - Expired commits persist the journal's event mode before
   `POST /v1/events`; a crash cannot make replay return to a doomed commit.
+- Pull-request and release CI run every shared durable-recovery and
+  guarantee-boundary scenario, and publishing is gated on conformance.
 
 ### Compatibility
 
