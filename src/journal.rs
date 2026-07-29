@@ -17,17 +17,12 @@ use crate::models::{CommitRequest, EventCreateRequest};
 const RECORD_VERSION: u8 = 1;
 const JOURNAL_SUFFIX: &str = ".json";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum JournalMode {
+    #[default]
     Commit,
     Event,
-}
-
-impl Default for JournalMode {
-    fn default() -> Self {
-        Self::Commit
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
