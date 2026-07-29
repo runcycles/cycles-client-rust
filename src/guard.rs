@@ -37,11 +37,15 @@
 
 use tokio_util::sync::CancellationToken;
 
-use crate::client::CyclesClient;
+use crate::client::{
+    is_expired_commit, is_settlement_retryable, requires_durable_replay, retry_deadline_ms,
+    CyclesClient,
+};
 use crate::error::Error;
 use crate::heartbeat::{start_heartbeat, CreateLeaseSample};
+use crate::journal::{JournalMode, PendingCommitRecord};
 use crate::models::common::{Action, Subject};
-use crate::models::enums::{CommitStatus, ErrorCode, EventStatus};
+use crate::models::enums::{CommitStatus, EventStatus};
 use crate::models::request::{CommitRequest, EventCreateRequest, ReleaseRequest};
 use crate::models::response::{CommitResponse, ReleaseResponse};
 use crate::models::{Caps, Decision, ReservationId};
@@ -181,13 +185,13 @@ impl ReservationGuard {
     /// keeps extending the reservation's TTL until the outcome is final, so
     /// the reservation cannot expire mid-retry.
     ///
-    /// The returned result is final: `Ok` means the spend was recorded;
-    /// `Err` means no further commit attempt will be made (the retry stopped
-    /// on a non-retryable error or exhausted
-    /// [`retry_max_attempts`](crate::config::CyclesConfig::retry_max_attempts)),
-    /// so the caller may safely compensate. Under a persistent outage this
-    /// call blocks for the full backoff schedule; tune the `retry_*` config
-    /// knobs or disable retry for fail-fast single-attempt commits.
+    /// The actual amount is durably journaled before the first request when
+    /// journaling is enabled (the default). `Ok` means the spend was
+    /// recorded. An understood terminal rejection is returned as its normal
+    /// error and removes the record. Retry exhaustion, authentication
+    /// failure, or an ambiguous client response returns
+    /// [`Error::CommitPending`]: the record remains queued for same-key
+    /// replay, so the caller MUST NOT compensate with a different key.
     ///
     /// # Expired-reservation event fallback
     ///
@@ -215,29 +219,44 @@ impl ReservationGuard {
     /// [`CommitStatus::RecoveredViaEvent`] and
     /// [`CommitResponse::recovered_via_event`] set to the recorded event's
     /// ID. On fallback failure, it returns
-    /// [`Error::CommitRecoveryFailed`] carrying **both** the original
-    /// `RESERVATION_EXPIRED` error and the event error — the spend is not
-    /// recorded and the caller must compensate.
+    /// [`Error::CommitPending`] when the event failure remains recoverable or
+    /// ambiguous and durable journaling succeeded. With journaling disabled,
+    /// [`Error::CommitRecoveryFailed`] carries both underlying errors.
     ///
     /// # Cancellation
     ///
-    /// Recovery is **not** cancellation-transparent: if the caller times out
-    /// or drops this future mid-recovery, the outcome is unknown — the
-    /// fallback event may or may not have landed server-side. It is safe to
-    /// re-`POST /v1/events` with the commit's idempotency key to settle the
-    /// question: the server records the event exactly once per key, so a
-    /// re-post either lands the spend or dedupes against the one that
-    /// already did.
+    /// Recovery is cancellation-safe when the journal write succeeded: the
+    /// pending record predates the first commit request and event mode is
+    /// persisted before fallback. With journaling disabled, cancellation can
+    /// still leave an unknown outcome; only the original idempotency key is
+    /// safe for manual recovery.
     pub async fn commit(mut self, req: CommitRequest) -> Result<CommitResponse, Error> {
         self.finalized = true;
+        let event_req = self.event_fallback_request(&req);
+        // Persist once actual usage is known and before the first request.
+        // This closes the process-death window while the initial commit
+        // response is pending. Journal I/O remains best-effort.
+        let mut pending = PendingCommitRecord::commit(
+            self.id.as_str().to_string(),
+            self.client.config().base_url.clone(),
+            req.clone(),
+            event_req.clone(),
+        );
+        let journaled = self.client.journal_pending(&pending);
         // The heartbeat is deliberately NOT cancelled yet: it must keep the
         // reservation alive while retries run. Cancelled below once the
         // outcome is final (Drop also cancels, as a backstop).
         let result = match self.client.commit_reservation(&self.id, &req).await {
             Ok(resp) => Ok(resp),
-            Err(e) if e.is_retryable() => {
+            Err(e) if is_settlement_retryable(&e) => {
+                let client = self.client.clone();
                 CommitRetryEngine::new(self.client.config())
-                    .retry(&self.client, &self.id, &req, e)
+                    .retry_observed(&self.client, &self.id, &req, e, |error| {
+                        if journaled {
+                            pending.not_before_ms = error.retry_after().map(retry_deadline_ms);
+                            client.journal_pending(&pending);
+                        }
+                    })
                     .await
             }
             Err(e) => Err(e),
@@ -249,20 +268,48 @@ impl ReservationGuard {
         // parsed into a typed error code: the status alone means the
         // reservation is settled/expired.
         let result = match result {
-            Err(e)
-                if e.error_code() == Some(ErrorCode::ReservationExpired)
-                    || e.status() == Some(410) =>
-            {
+            Err(e) if is_expired_commit(&e) => {
                 // The reservation is expired for good — stop the heartbeat
                 // BEFORE recovery so it doesn't keep sending doomed extend
                 // requests (traffic and log noise) while the fallback runs.
                 self.cancel.cancel();
-                self.recover_via_event(&req, e).await
+                pending.mode = JournalMode::Event;
+                pending.not_before_ms = None;
+                if journaled {
+                    self.client.journal_pending(&pending);
+                }
+                self.recover_via_event(&req, &event_req, e).await
             }
             other => other,
         };
         self.cancel.cancel();
-        result
+        match result {
+            Ok(response) => {
+                if journaled {
+                    self.client.discard_pending(self.id.as_str());
+                }
+                Ok(response)
+            }
+            Err(error) if journaled && requires_durable_replay(&error) => {
+                pending.not_before_ms = error.retry_after().map(retry_deadline_ms);
+                self.client.journal_pending(&pending);
+                tracing::warn!(
+                    reservation_id = %self.id,
+                    error = %error,
+                    "commit outcome unresolved; durable journal retained for replay"
+                );
+                Err(Error::CommitPending {
+                    reservation_id: self.id.as_str().to_string(),
+                    last_error: Box::new(error),
+                })
+            }
+            Err(error) => {
+                if journaled {
+                    self.client.discard_pending(self.id.as_str());
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Record the spend of an expired-reservation commit as a post-hoc
@@ -270,6 +317,7 @@ impl ReservationGuard {
     async fn recover_via_event(
         &self,
         req: &CommitRequest,
+        event_req: &EventCreateRequest,
         commit_error: Error,
     ) -> Result<CommitResponse, Error> {
         tracing::warn!(
@@ -277,49 +325,24 @@ impl ReservationGuard {
             "commit rejected with RESERVATION_EXPIRED; recovering spend via direct-debit event"
         );
 
-        // Carry the commit metadata over, marked so the ledger shows why the
-        // spend arrived as an event. Non-object metadata (legal JSON, if
-        // unusual) is preserved under "original_metadata".
-        let mut metadata = match req.metadata.clone() {
-            Some(serde_json::Value::Object(map)) => map,
-            Some(other) => {
-                let mut map = serde_json::Map::new();
-                map.insert("original_metadata".to_string(), other);
-                map
-            }
-            None => serde_json::Map::new(),
-        };
-        metadata.insert(
-            "recovered_reservation_id".to_string(),
-            serde_json::Value::String(self.id.as_str().to_string()),
-        );
-        metadata.insert(
-            "recovery_reason".to_string(),
-            serde_json::Value::String("commit_after_reservation_expired".to_string()),
-        );
-
-        let event_req = EventCreateRequest {
-            // Same key as the commit: the event namespace is separate from
-            // the commit namespace server-side, and reusing the key makes
-            // the recovery itself exactly-once across retries and racing
-            // clients.
-            idempotency_key: req.idempotency_key.clone(),
-            subject: self.subject.clone(),
-            action: self.action.clone(),
-            actual: req.actual.clone(),
-            // No overage policy: the server default ALLOW_IF_AVAILABLE never
-            // rejects, which is what we want — the spend already happened.
-            overage_policy: None,
-            metrics: req.metrics.clone(),
-            client_time_ms: None,
-            metadata: Some(serde_json::Value::Object(metadata)),
-        };
-
-        let event_result = match self.client.create_event(&event_req).await {
+        let event_result = match self.client.create_event(event_req).await {
             Ok(resp) => Ok(resp),
-            Err(e) if e.is_retryable() => {
+            Err(e) if is_settlement_retryable(&e) => {
+                let client = self.client.clone();
                 CommitRetryEngine::new(self.client.config())
-                    .retry_event(&self.client, &event_req, e)
+                    .retry_event_observed(&self.client, event_req, e, |error| {
+                        if let Some(retry_after) = error.retry_after() {
+                            let mut record = PendingCommitRecord::commit(
+                                self.id.as_str().to_string(),
+                                self.client.config().base_url.clone(),
+                                req.clone(),
+                                event_req.clone(),
+                            );
+                            record.mode = JournalMode::Event;
+                            record.not_before_ms = Some(retry_deadline_ms(retry_after));
+                            client.journal_pending(&record);
+                        }
+                    })
                     .await
             }
             Err(e) => Err(e),
@@ -369,6 +392,46 @@ impl ReservationGuard {
                     event_error: Box::new(event_error),
                 })
             }
+        }
+    }
+
+    fn event_fallback_request(&self, req: &CommitRequest) -> EventCreateRequest {
+        // Carry the commit metadata over, marked so the ledger shows why the
+        // spend arrived as an event. Non-object metadata (legal JSON, if
+        // unusual) is preserved under "original_metadata".
+        let mut metadata = match req.metadata.clone() {
+            Some(serde_json::Value::Object(map)) => map,
+            Some(other) => {
+                let mut map = serde_json::Map::new();
+                map.insert("original_metadata".to_string(), other);
+                map
+            }
+            None => serde_json::Map::new(),
+        };
+        metadata.insert(
+            "recovered_reservation_id".to_string(),
+            serde_json::Value::String(self.id.as_str().to_string()),
+        );
+        metadata.insert(
+            "recovery_reason".to_string(),
+            serde_json::Value::String("commit_after_reservation_expired".to_string()),
+        );
+
+        EventCreateRequest {
+            // Same key as the commit: the event namespace is separate from
+            // the commit namespace server-side, and reusing the key makes
+            // the recovery itself exactly-once across retries and racing
+            // clients.
+            idempotency_key: req.idempotency_key.clone(),
+            subject: self.subject.clone(),
+            action: self.action.clone(),
+            actual: req.actual.clone(),
+            // No overage policy: the server default ALLOW_IF_AVAILABLE never
+            // rejects, which is what we want — the spend already happened.
+            overage_policy: None,
+            metrics: req.metrics.clone(),
+            client_time_ms: None,
+            metadata: Some(serde_json::Value::Object(metadata)),
         }
     }
 

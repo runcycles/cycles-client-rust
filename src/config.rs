@@ -1,5 +1,6 @@
 //! Client configuration.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::Error;
@@ -37,6 +38,13 @@ pub struct CyclesConfig {
     pub retry_multiplier: f64,
     /// Maximum delay between retries.
     pub retry_max_delay: Duration,
+    /// Whether unresolved commits are persisted for replay after restart.
+    pub journal_enabled: bool,
+    /// Base directory for the pending-commit journal.
+    ///
+    /// `None` uses the platform home directory under
+    /// `.runcycles/commit-journal`.
+    pub journal_dir: Option<PathBuf>,
 }
 
 impl CyclesConfig {
@@ -90,6 +98,8 @@ impl CyclesConfig {
             retry_initial_delay: env_duration_ms("RETRY_INITIAL_DELAY", 500),
             retry_multiplier: env_f64("RETRY_MULTIPLIER", 2.0),
             retry_max_delay: env_duration_ms("RETRY_MAX_DELAY", 30_000),
+            journal_enabled: env_opt("JOURNAL_ENABLED").is_none_or(|v| v.to_lowercase() != "false"),
+            journal_dir: env_opt("JOURNAL_DIR").map(PathBuf::from),
         })
     }
 }
@@ -131,6 +141,8 @@ impl CyclesClientBuilder {
                 retry_initial_delay: Duration::from_millis(500),
                 retry_multiplier: 2.0,
                 retry_max_delay: Duration::from_secs(30),
+                journal_enabled: true,
+                journal_dir: None,
             },
             http_client: None,
         }
@@ -211,6 +223,18 @@ impl CyclesClientBuilder {
     /// Set the maximum delay between commit retries.
     pub fn retry_max_delay(mut self, delay: Duration) -> Self {
         self.config.retry_max_delay = delay;
+        self
+    }
+
+    /// Enable or disable durable pending-commit journaling.
+    pub fn journal_enabled(mut self, enabled: bool) -> Self {
+        self.config.journal_enabled = enabled;
+        self
+    }
+
+    /// Set the base directory for the durable pending-commit journal.
+    pub fn journal_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.config.journal_dir = Some(directory.into());
         self
     }
 

@@ -211,6 +211,7 @@ let client = CyclesClient::builder("my-api-key", "http://localhost:7878")
     .read_timeout(std::time::Duration::from_secs(5))
     .retry_enabled(true)
     .retry_max_attempts(5)
+    .journal_enabled(true)
     .build();
 ```
 
@@ -236,15 +237,35 @@ attempts). On HTTP 429 the retry waits at least the server's `Retry-After`
 delay, even when that exceeds `retry_max_delay`. Retries reuse the original
 request — same idempotency key — so a commit that already landed server-side
 cannot double-charge, and the reservation heartbeat keeps extending the TTL
-until the outcome is final, so the reservation cannot expire mid-retry.
+while inline retries run.
 
-The result of `commit()` is final: `Ok` means the spend was recorded, `Err`
-means no further commit attempt will ever be made — safe to compensate.
-Under a persistent outage the call blocks for the full backoff schedule;
-tune the knobs or set `retry_enabled(false)` for fail-fast single-attempt
-commits. Env knobs: `CYCLES_RETRY_ENABLED`, `CYCLES_RETRY_MAX_ATTEMPTS`,
-`CYCLES_RETRY_INITIAL_DELAY`, `CYCLES_RETRY_MULTIPLIER`,
+Actual spend is also written atomically to a durable journal before the first
+commit request. Only a schema-valid HTTP 200 `COMMITTED` response (or a
+schema-valid HTTP 201 `APPLIED` event fallback) proves settlement success;
+other 2xx outcomes remain ambiguous. A proven success or understood terminal
+rejection removes the record. Retry exhaustion, authentication failure, and an
+ambiguous client response retain it for next-run replay. In that case `commit()` returns
+`Error::CommitPending`; do not compensate with a different idempotency key.
+Clients created inside Tokio automatically start one replay pass, and
+`flush_pending_commits_with_timeout(...)` provides a bounded graceful-shutdown
+drain. The blocking client exposes the same operation.
+
+The journal defaults to `~/.runcycles/commit-journal`, partitioned by server
+and principal. A configured tenant is the principal, so rotating its API key
+does not orphan pending records; API keys are never written to records. Set
+`journal_enabled(false)` only if the application supplies equivalent
+durability. Configuration is also available through `CYCLES_JOURNAL_ENABLED`
+and `CYCLES_JOURNAL_DIR`. Retry env knobs remain
+`CYCLES_RETRY_ENABLED`, `CYCLES_RETRY_MAX_ATTEMPTS`,
+`CYCLES_RETRY_INITIAL_DELAY`, `CYCLES_RETRY_MULTIPLIER`, and
 `CYCLES_RETRY_MAX_DELAY`.
+
+The durable journal belongs to the high-level `ReservationGuard::commit`
+lifecycle. Low-level `commit_reservation` and `create_event` calls enforce the
+same response predicates and expose the original idempotent primitives, but do
+not automatically persist application-owned requests. Callers using those
+primitives directly must provide equivalent durable retry storage if they need
+restart convergence.
 
 ### Expired-commit event fallback
 
@@ -261,10 +282,11 @@ failures are retried with the same backoff policy.
 
 On fallback success, `commit()` returns `Ok` with
 `CommitStatus::RecoveredViaEvent` and `CommitResponse::recovered_via_event`
-set to the recorded event's ID. If the fallback fails too, `commit()`
-returns `Error::CommitRecoveryFailed` carrying both the original commit
-error and the event error — the spend is not recorded and the caller must
-compensate.
+set to the recorded event's ID. The journal switches to event mode before the
+fallback attempt, so a restart never retries an already-expired reservation.
+An unresolved fallback remains journaled and returns `Error::CommitPending`.
+With journaling disabled, fallback failure returns
+`Error::CommitRecoveryFailed` carrying both underlying errors.
 
 ## Features
 

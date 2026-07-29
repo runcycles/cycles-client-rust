@@ -8,7 +8,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn setup() -> (MockServer, CyclesClient) {
     let server = MockServer::start().await;
-    let client = CyclesClient::builder("test-key", server.uri()).build();
+    let client = CyclesClient::builder("test-key", server.uri())
+        .journal_enabled(false)
+        .build();
     (server, client)
 }
 

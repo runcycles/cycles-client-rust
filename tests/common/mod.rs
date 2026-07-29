@@ -67,7 +67,9 @@ pub async fn mount_extend(server: &MockServer, reservation_id: &str) {
 /// Full guard-lifecycle scaffold: client plus mounted reserve
 /// (`ALLOW_WITH_CAPS`, id `rsv_test`), extend, and release mocks.
 pub async fn setup_with_reservation(server: &MockServer) -> CyclesClient {
-    let client = CyclesClient::builder("key", server.uri()).build();
+    let client = CyclesClient::builder("key", server.uri())
+        .journal_enabled(false)
+        .build();
 
     Mock::given(method("POST"))
         .and(path("/v1/reservations"))

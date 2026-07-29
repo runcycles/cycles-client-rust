@@ -1,5 +1,6 @@
 //! Async HTTP client for the Cycles API.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use crate::constants::{
 };
 use crate::error::Error;
 use crate::guard::ReservationGuard;
+use crate::journal::{now_ms, CommitJournal, JournalMode, PendingCommitRecord};
 use crate::models::enums::Unit;
 use crate::models::request::{
     BalanceParams, CommitRequest, DecisionRequest, EventCreateRequest, ExtendRequest,
@@ -36,6 +38,44 @@ use crate::validation;
 /// reserves in a different unit (e.g. `TOKENS`). The raw 404 message then
 /// reads like a plain scope-lookup miss, which is misleading. See issue #8.
 const BUDGET_NOT_FOUND_MARKER: &str = "Budget not found for provided scope";
+
+enum ReplayOutcome {
+    Terminal,
+    Retain(Option<Duration>),
+}
+
+pub(crate) fn is_expired_commit(error: &Error) -> bool {
+    error.error_code() == Some(ErrorCode::ReservationExpired) || error.status() == Some(410)
+}
+
+pub(crate) fn requires_durable_replay(error: &Error) -> bool {
+    match error {
+        Error::Transport(_) | Error::Deserialization(_) | Error::CommitPending { .. } => true,
+        Error::Api { code, .. } => {
+            error.is_retryable()
+                || error.is_auth_error()
+                || code.is_none()
+                || *code == Some(ErrorCode::Unknown)
+        }
+        Error::BudgetExceeded { .. } => error.is_retryable(),
+        Error::CommitRecoveryFailed { event_error, .. } => requires_durable_replay(event_error),
+        // A validation failure while decoding a successful fallback is
+        // ambiguous. Generated request validation happens before journaling,
+        // so retaining here cannot make a caller input error retry forever.
+        Error::Validation(_) => true,
+        Error::Config(_) => false,
+    }
+}
+
+pub(crate) fn is_settlement_retryable(error: &Error) -> bool {
+    error.is_retryable() || matches!(error, Error::Deserialization(_))
+}
+
+pub(crate) fn retry_deadline_ms(delay: Duration) -> u64 {
+    let bounded = delay.min(crate::retry::RETRY_AFTER_CAP);
+    let milliseconds = u64::try_from(bounded.as_millis()).unwrap_or(u64::MAX);
+    now_ms().saturating_add(milliseconds)
+}
 const CREATE_RESPONSE_FIELDS: &[&str] = &[
     "decision",
     "reservation_id",
@@ -52,6 +92,14 @@ const CREATE_RESPONSE_FIELDS: &[&str] = &[
 ];
 const EXTEND_RESPONSE_FIELDS: &[&str] =
     &["status", "expires_at_ms", "remaining_ttl_ms", "balances"];
+const COMMIT_RESPONSE_FIELDS: &[&str] = &[
+    "status",
+    "charged",
+    "released",
+    "balances",
+    "cycles_evidence",
+];
+const EVENT_RESPONSE_FIELDS: &[&str] = &["status", "event_id", "charged", "balances"];
 const AMOUNT_FIELDS: &[&str] = &["unit", "amount"];
 const CAPS_FIELDS: &[&str] = &[
     "max_tokens",
@@ -239,6 +287,35 @@ fn is_schema_valid_extend_body(value: &Value) -> bool {
         && object.get("balances").is_none_or(is_balances)
 }
 
+fn is_schema_valid_commit_body(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    has_exact_or_optional_fields(object, COMMIT_RESPONSE_FIELDS)
+        && object.get("status").and_then(Value::as_str) == Some("COMMITTED")
+        && object
+            .get("charged")
+            .is_some_and(|amount| is_amount(amount, false))
+        && object
+            .get("released")
+            .is_none_or(|amount| is_amount(amount, false))
+        && object.get("balances").is_none_or(is_balances)
+        && object.get("cycles_evidence").is_none_or(is_evidence_ref)
+}
+
+fn is_schema_valid_event_body(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    has_exact_or_optional_fields(object, EVENT_RESPONSE_FIELDS)
+        && object.get("status").and_then(Value::as_str) == Some("APPLIED")
+        && object.get("event_id").is_some_and(Value::is_string)
+        && object
+            .get("charged")
+            .is_none_or(|amount| is_amount(amount, false))
+        && object.get("balances").is_none_or(is_balances)
+}
+
 fn parse_retry_after_delta(value: &str) -> Option<Duration> {
     let value = value.trim();
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -329,6 +406,8 @@ pub struct CyclesClient {
 struct ClientInner {
     http: reqwest::Client,
     config: CyclesConfig,
+    journal: Option<CommitJournal>,
+    journal_replay_started: AtomicBool,
 }
 
 impl std::fmt::Debug for CyclesClient {
@@ -360,14 +439,223 @@ impl CyclesClient {
                 .expect("failed to build HTTP client")
         });
 
-        Self {
-            inner: Arc::new(ClientInner { http, config }),
+        let journal = CommitJournal::for_config(&config);
+        if config.journal_enabled && journal.is_none() {
+            tracing::warn!(
+                "durable commit journal is enabled but no home or explicit journal directory is available"
+            );
         }
+        let client = Self {
+            inner: Arc::new(ClientInner {
+                http,
+                config,
+                journal,
+                journal_replay_started: AtomicBool::new(false),
+            }),
+        };
+        client.start_journal_replay();
+        client
     }
 
     /// Access the client configuration.
     pub fn config(&self) -> &CyclesConfig {
         &self.inner.config
+    }
+
+    /// Replay unresolved settlements from the durable journal.
+    ///
+    /// A client created inside a Tokio runtime starts this once
+    /// automatically. Applications can await it explicitly during startup or
+    /// graceful shutdown. The return value is the number of journal records
+    /// removed after a proven terminal outcome.
+    pub async fn flush_pending_commits(&self) -> usize {
+        self.inner
+            .journal_replay_started
+            .store(true, Ordering::Release);
+        let Some(journal) = self.inner.journal.clone() else {
+            return 0;
+        };
+        let records = journal.load_pending(&self.inner.config.base_url);
+        let mut tasks = tokio::task::JoinSet::new();
+        for record in records {
+            let client = self.clone();
+            tasks.spawn(async move { client.replay_pending_record(record).await });
+        }
+        let mut settled = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(true) => settled += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "pending-commit replay task did not complete"
+                    );
+                }
+            }
+        }
+        settled
+    }
+
+    /// Replay unresolved settlements, waiting at most `timeout`.
+    ///
+    /// Cancellation at the timeout is safe: every unresolved record remains
+    /// on disk and will be retried on the next flush or process start.
+    pub async fn flush_pending_commits_with_timeout(&self, timeout: Duration) -> usize {
+        tokio::time::timeout(timeout, self.flush_pending_commits())
+            .await
+            .unwrap_or(0)
+    }
+
+    fn start_journal_replay(&self) {
+        if self.inner.journal.is_none()
+            || self
+                .inner
+                .journal_replay_started
+                .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.inner
+                .journal_replay_started
+                .store(false, Ordering::Release);
+            return;
+        };
+        let client = self.clone();
+        handle.spawn(async move {
+            let settled = client.flush_pending_commits().await;
+            if settled > 0 {
+                tracing::info!(settled, "replayed durable pending-commit journal entries");
+            }
+        });
+    }
+
+    pub(crate) fn journal_pending(&self, record: &PendingCommitRecord) -> bool {
+        let Some(journal) = &self.inner.journal else {
+            return false;
+        };
+        match journal.record(record) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    reservation_id = %record.reservation_id,
+                    error = %error,
+                    "failed to journal unresolved commit; continuing without durability"
+                );
+                false
+            }
+        }
+    }
+
+    pub(crate) fn discard_pending(&self, reservation_id: &str) {
+        if let Some(journal) = &self.inner.journal {
+            if let Err(error) = journal.discard(reservation_id) {
+                tracing::warn!(
+                    reservation_id,
+                    error = %error,
+                    "failed to remove settled pending-commit journal entry"
+                );
+            }
+        }
+    }
+
+    async fn replay_pending_record(&self, mut record: PendingCommitRecord) -> bool {
+        if let Some(not_before_ms) = record.not_before_ms {
+            let delay_ms = not_before_ms.saturating_sub(now_ms());
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+
+        let outcome = match record.mode {
+            JournalMode::Commit => {
+                let Some(commit) = record.commit_body.clone() else {
+                    return false;
+                };
+                let reservation_id = ReservationId::new(record.reservation_id.clone());
+                let result = match self.commit_reservation(&reservation_id, &commit).await {
+                    Ok(response) => Ok(response),
+                    Err(error) if is_settlement_retryable(&error) => {
+                        let client = self.clone();
+                        crate::retry::CommitRetryEngine::new(self.config())
+                            .retry_observed(self, &reservation_id, &commit, error, |failure| {
+                                record.not_before_ms = failure.retry_after().map(retry_deadline_ms);
+                                client.journal_pending(&record);
+                            })
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(_) => ReplayOutcome::Terminal,
+                    Err(error) if is_expired_commit(&error) => {
+                        let Some(event) = record.event_fallback_body.clone() else {
+                            return false;
+                        };
+                        record.mode = JournalMode::Event;
+                        record.not_before_ms = None;
+                        if !self.journal_pending(&record) {
+                            return false;
+                        }
+                        self.replay_event(&event, &mut record).await
+                    }
+                    Err(error) if requires_durable_replay(&error) => {
+                        ReplayOutcome::Retain(error.retry_after())
+                    }
+                    Err(_) => ReplayOutcome::Terminal,
+                }
+            }
+            JournalMode::Event => {
+                let Some(event) = record.event_fallback_body.as_ref() else {
+                    return false;
+                };
+                let event = event.clone();
+                self.replay_event(&event, &mut record).await
+            }
+        };
+
+        match outcome {
+            ReplayOutcome::Terminal => {
+                self.discard_pending(&record.reservation_id);
+                true
+            }
+            ReplayOutcome::Retain(retry_after) => {
+                record.not_before_ms = retry_after.map(retry_deadline_ms);
+                self.journal_pending(&record);
+                false
+            }
+        }
+    }
+
+    async fn replay_event(
+        &self,
+        event: &EventCreateRequest,
+        record: &mut PendingCommitRecord,
+    ) -> ReplayOutcome {
+        use crate::models::EventStatus;
+
+        let result = match self.create_event(event).await {
+            Ok(response) => Ok(response),
+            Err(error) if is_settlement_retryable(&error) => {
+                let client = self.clone();
+                crate::retry::CommitRetryEngine::new(self.config())
+                    .retry_event_observed(self, event, error, |failure| {
+                        record.not_before_ms = failure.retry_after().map(retry_deadline_ms);
+                        client.journal_pending(record);
+                    })
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(response) if response.status == EventStatus::Applied => ReplayOutcome::Terminal,
+            Ok(_) => ReplayOutcome::Retain(None),
+            Err(error) if requires_durable_replay(&error) => {
+                ReplayOutcome::Retain(error.retry_after())
+            }
+            Err(_) => ReplayOutcome::Terminal,
+        }
     }
 
     fn attempt_timeout(&self) -> Duration {
@@ -503,6 +791,7 @@ impl CyclesClient {
         ),
         Error,
     > {
+        self.start_journal_replay();
         let mut final_error = None;
         for attempt in 0..2 {
             let sent_at = tokio::time::Instant::now();
@@ -580,8 +869,15 @@ impl CyclesClient {
         req: &CommitRequest,
     ) -> Result<CommitResponse, Error> {
         let path = format!("{RESERVATIONS_PATH}/{}/commit", id.as_str());
-        self.post_json(&path, req, Some(req.idempotency_key.as_str()))
-            .await
+        self.post_json_strict(
+            &path,
+            req,
+            Some(req.idempotency_key.as_str()),
+            200,
+            "commit",
+            is_schema_valid_commit_body,
+        )
+        .await
     }
 
     /// Release (cancel) a reservation, returning reserved budget.
@@ -620,6 +916,7 @@ impl CyclesClient {
         id: &ReservationId,
         req: &ExtendRequest,
     ) -> Result<ExtendResponse, Error> {
+        self.start_journal_replay();
         let url = format!(
             "{}{RESERVATIONS_PATH}/{}/extend",
             self.inner.config.base_url,
@@ -672,9 +969,16 @@ impl CyclesClient {
         &self,
         req: &EventCreateRequest,
     ) -> Result<EventCreateResponse, Error> {
-        self.post_json(EVENTS_PATH, req, Some(req.idempotency_key.as_str()))
-            .await
-            .map_err(|e| enrich_budget_not_found(e, req.actual.unit))
+        self.post_json_strict(
+            EVENTS_PATH,
+            req,
+            Some(req.idempotency_key.as_str()),
+            201,
+            "event",
+            is_schema_valid_event_body,
+        )
+        .await
+        .map_err(|e| enrich_budget_not_found(e, req.actual.unit))
     }
 
     /// List reservations with optional filters.
@@ -721,6 +1025,7 @@ impl CyclesClient {
         body: &B,
         idempotency_key: Option<&str>,
     ) -> Result<ApiResponse<R>, Error> {
+        self.start_journal_replay();
         let url = format!("{}{}", self.inner.config.base_url, path);
 
         let mut headers = HeaderMap::new();
@@ -761,11 +1066,66 @@ impl CyclesClient {
         }
     }
 
+    async fn post_json_strict<B: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        idempotency_key: Option<&str>,
+        expected_status: u16,
+        operation: &str,
+        validate: impl FnOnce(&Value) -> bool,
+    ) -> Result<R, Error> {
+        self.start_journal_replay();
+        let url = format!("{}{}", self.inner.config.base_url, path);
+        let api_key = HeaderValue::from_str(&self.inner.config.api_key)
+            .map_err(|error| Error::Config(format!("invalid API key header value: {error}")))?;
+        let mut request = self
+            .inner
+            .http
+            .post(&url)
+            .timeout(self.attempt_timeout())
+            .header(API_KEY_HEADER, api_key)
+            .json(body);
+        if let Some(key) = idempotency_key {
+            request = request.header(IDEMPOTENCY_KEY_HEADER, key);
+        }
+
+        let resp = request.send().await?;
+        let response_headers = resp.headers().clone();
+        let status = resp.status().as_u16();
+        if status == expected_status {
+            let value: Value = resp.json().await.map_err(|error| {
+                Error::Deserialization(serde::de::Error::custom(format!(
+                    "ambiguous {operation} response: HTTP {expected_status} body is not valid JSON: {error}"
+                )))
+            })?;
+            if !validate(&value) {
+                return Err(Error::Deserialization(serde::de::Error::custom(format!(
+                    "ambiguous {operation} response: HTTP {expected_status} body is not schema-valid"
+                ))));
+            }
+            serde_json::from_value(value).map_err(|error| {
+                Error::Deserialization(serde::de::Error::custom(format!(
+                    "ambiguous {operation} response: HTTP {expected_status} body could not be decoded: {error}"
+                )))
+            })
+        } else if (200..300).contains(&status) {
+            Err(Error::Deserialization(serde::de::Error::custom(format!(
+                "ambiguous {operation} response: HTTP {status} is a non-{expected_status} 2xx"
+            ))))
+        } else {
+            Err(self
+                .parse_error_response(status, resp, &response_headers)
+                .await)
+        }
+    }
+
     async fn get_json<Q: Serialize, R: DeserializeOwned>(
         &self,
         path: &str,
         query: Option<&Q>,
     ) -> Result<R, Error> {
+        self.start_journal_replay();
         let url = format!("{}{}", self.inner.config.base_url, path);
 
         let mut request = self
@@ -870,7 +1230,171 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::PendingCommitRecord;
+    use crate::models::{Action, Amount, IdempotencyKey, Subject};
     use serde_json::json;
+
+    fn test_event() -> EventCreateRequest {
+        EventCreateRequest::builder()
+            .idempotency_key(IdempotencyKey::new("idem-test"))
+            .subject(Subject {
+                tenant: Some("acme".to_string()),
+                ..Subject::default()
+            })
+            .action(Action::new("llm.completion", "test"))
+            .actual(Amount::tokens(1))
+            .build()
+    }
+
+    fn test_commit() -> CommitRequest {
+        CommitRequest::builder()
+            .idempotency_key(IdempotencyKey::new("idem-test"))
+            .actual(Amount::tokens(1))
+            .build()
+    }
+
+    fn pending_record(mode: JournalMode) -> PendingCommitRecord {
+        PendingCommitRecord {
+            version: 1,
+            reservation_id: "rsv_test".to_string(),
+            base_url: "http://localhost".to_string(),
+            mode,
+            commit_body: Some(test_commit()),
+            event_fallback_body: Some(test_event()),
+            recorded_at_ms: now_ms(),
+            not_before_ms: None,
+        }
+    }
+
+    fn api_error(status: u16, code: Option<ErrorCode>) -> Error {
+        Error::Api {
+            status,
+            code,
+            message: "test".to_string(),
+            request_id: None,
+            retry_after: None,
+            details: None,
+        }
+    }
+
+    #[test]
+    fn durable_replay_classification_covers_all_error_families() {
+        let serde_error = serde_json::from_str::<String>("not-json").unwrap_err();
+        assert!(requires_durable_replay(&Error::Deserialization(
+            serde_error
+        )));
+        assert!(requires_durable_replay(&Error::CommitPending {
+            reservation_id: "rsv".to_string(),
+            last_error: Box::new(api_error(503, Some(ErrorCode::InternalError))),
+        }));
+        assert!(requires_durable_replay(&api_error(
+            503,
+            Some(ErrorCode::InternalError)
+        )));
+        assert!(requires_durable_replay(&api_error(
+            401,
+            Some(ErrorCode::Unauthorized)
+        )));
+        assert!(requires_durable_replay(&api_error(400, None)));
+        assert!(requires_durable_replay(&api_error(
+            400,
+            Some(ErrorCode::Unknown)
+        )));
+        assert!(!requires_durable_replay(&api_error(
+            400,
+            Some(ErrorCode::InvalidRequest)
+        )));
+        assert!(!requires_durable_replay(&Error::BudgetExceeded {
+            message: "budget".to_string(),
+            affected_scopes: vec![],
+            retry_after: None,
+            request_id: None,
+            status: Some(409),
+        }));
+        assert!(requires_durable_replay(&Error::CommitRecoveryFailed {
+            reservation_id: "rsv".to_string(),
+            commit_error: Box::new(api_error(410, Some(ErrorCode::ReservationExpired),)),
+            event_error: Box::new(api_error(503, Some(ErrorCode::InternalError))),
+        }));
+        assert!(requires_durable_replay(&Error::Validation(
+            "ambiguous success".to_string()
+        )));
+        assert!(!requires_durable_replay(&Error::Config(
+            "invalid config".to_string()
+        )));
+    }
+
+    #[test]
+    fn retry_deadline_is_bounded_to_the_fleet_cap() {
+        let before = now_ms();
+        let deadline = retry_deadline_ms(Duration::from_secs(7200));
+        assert!(deadline >= before + 3_599_000);
+        assert!(deadline <= now_ms() + 3_600_000);
+    }
+
+    #[test]
+    fn settlement_retry_classification_includes_ambiguous_successes() {
+        let serde_error = serde_json::from_str::<String>("not-json").unwrap_err();
+        assert!(is_settlement_retryable(&Error::Deserialization(
+            serde_error
+        )));
+        assert!(is_settlement_retryable(&api_error(
+            503,
+            Some(ErrorCode::InternalError)
+        )));
+        assert!(!is_settlement_retryable(&api_error(
+            400,
+            Some(ErrorCode::InvalidRequest)
+        )));
+    }
+
+    #[tokio::test]
+    async fn flush_without_a_journal_is_a_noop() {
+        let client = CyclesClient::builder("key", "http://localhost")
+            .journal_enabled(false)
+            .build();
+        assert_eq!(client.flush_pending_commits().await, 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_in_memory_replay_records_are_retained() {
+        let client = CyclesClient::builder("key", "http://localhost")
+            .journal_enabled(false)
+            .build();
+        let mut missing_commit = pending_record(JournalMode::Commit);
+        missing_commit.commit_body = None;
+        assert!(!client.replay_pending_record(missing_commit).await);
+
+        let mut missing_event = pending_record(JournalMode::Event);
+        missing_event.event_fallback_body = None;
+        assert!(!client.replay_pending_record(missing_event).await);
+    }
+
+    #[test]
+    fn journal_io_failures_are_best_effort() {
+        let temp = tempfile::tempdir().unwrap();
+        let blocked = temp.path().join("blocked");
+        std::fs::write(&blocked, "file").unwrap();
+        let client = CyclesClient::builder("key", "http://localhost")
+            .journal_dir(&blocked)
+            .build();
+        assert!(!client.journal_pending(&pending_record(JournalMode::Commit)));
+    }
+
+    #[test]
+    fn discard_io_failures_are_best_effort() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = CyclesClient::builder("key", "http://localhost")
+            .journal_dir(temp.path())
+            .build();
+        let identity = temp.path().join(crate::journal::auth_fingerprint(
+            "http://localhost",
+            "key",
+            None,
+        ));
+        std::fs::create_dir_all(identity.join("rsv_test.json")).unwrap();
+        client.discard_pending("rsv_test");
+    }
 
     #[test]
     fn strict_lease_response_validators_cover_full_nested_schema() {
@@ -921,6 +1445,30 @@ mod tests {
         let mut malformed_balance = extend;
         malformed_balance["balances"] = json!([{"scope": "missing-required-fields"}]);
         assert!(!is_schema_valid_extend_body(&malformed_balance));
+
+        let commit = json!({
+            "status": "COMMITTED",
+            "charged": {"unit": "TOKENS", "amount": 1},
+            "released": {"unit": "TOKENS", "amount": 0},
+            "cycles_evidence": {
+                "evidence_id": "a".repeat(64),
+                "cycles_evidence_url": "https://cycles.example/v1/evidence/id"
+            }
+        });
+        assert!(is_schema_valid_commit_body(&commit));
+        let mut invalid_commit = commit;
+        invalid_commit["status"] = json!("FUTURE");
+        assert!(!is_schema_valid_commit_body(&invalid_commit));
+
+        let event = json!({
+            "status": "APPLIED",
+            "event_id": "evt_strict",
+            "charged": {"unit": "TOKENS", "amount": 1}
+        });
+        assert!(is_schema_valid_event_body(&event));
+        let mut invalid_event = event;
+        invalid_event["extra"] = json!(true);
+        assert!(!is_schema_valid_event_body(&invalid_event));
     }
 
     #[test]

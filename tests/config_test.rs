@@ -14,6 +14,8 @@ fn builder_creates_client_with_defaults() {
     assert!(config.retry_enabled);
     assert_eq!(config.retry_max_attempts, 5);
     assert_eq!(config.retry_multiplier, 2.0);
+    assert!(config.journal_enabled);
+    assert!(config.journal_dir.is_none());
     assert!(config.tenant.is_none());
 }
 
@@ -33,6 +35,8 @@ fn builder_sets_all_fields() {
         .retry_initial_delay(Duration::from_millis(250))
         .retry_multiplier(1.5)
         .retry_max_delay(Duration::from_secs(10))
+        .journal_enabled(false)
+        .journal_dir("custom-journal")
         .build();
 
     let config = client.config();
@@ -49,6 +53,11 @@ fn builder_sets_all_fields() {
     assert_eq!(config.retry_initial_delay, Duration::from_millis(250));
     assert_eq!(config.retry_multiplier, 1.5);
     assert_eq!(config.retry_max_delay, Duration::from_secs(10));
+    assert!(!config.journal_enabled);
+    assert_eq!(
+        config.journal_dir.as_deref(),
+        Some(std::path::Path::new("custom-journal"))
+    );
 }
 
 #[test]
@@ -86,6 +95,8 @@ fn config_from_env() {
     std::env::set_var("TEST_CYCLES_RETRY_MAX_ATTEMPTS", "3");
     std::env::set_var("TEST_CYCLES_CONNECT_TIMEOUT", "1000");
     std::env::set_var("TEST_CYCLES_READ_TIMEOUT", "3000");
+    std::env::set_var("TEST_CYCLES_JOURNAL_ENABLED", "false");
+    std::env::set_var("TEST_CYCLES_JOURNAL_DIR", "test-journal");
 
     let config = CyclesConfig::from_env_with_prefix("TEST_CYCLES_").unwrap();
 
@@ -96,6 +107,11 @@ fn config_from_env() {
     assert_eq!(config.retry_max_attempts, 3);
     assert_eq!(config.connect_timeout, Duration::from_millis(1000));
     assert_eq!(config.read_timeout, Duration::from_millis(3000));
+    assert!(!config.journal_enabled);
+    assert_eq!(
+        config.journal_dir.as_deref(),
+        Some(std::path::Path::new("test-journal"))
+    );
 
     // Cleanup
     std::env::remove_var("TEST_CYCLES_BASE_URL");
@@ -105,6 +121,8 @@ fn config_from_env() {
     std::env::remove_var("TEST_CYCLES_RETRY_MAX_ATTEMPTS");
     std::env::remove_var("TEST_CYCLES_CONNECT_TIMEOUT");
     std::env::remove_var("TEST_CYCLES_READ_TIMEOUT");
+    std::env::remove_var("TEST_CYCLES_JOURNAL_ENABLED");
+    std::env::remove_var("TEST_CYCLES_JOURNAL_DIR");
 }
 
 #[test]
@@ -153,6 +171,8 @@ fn new_client_from_config() {
         retry_initial_delay: Duration::from_millis(500),
         retry_multiplier: 2.0,
         retry_max_delay: Duration::from_secs(30),
+        journal_enabled: true,
+        journal_dir: None,
     };
 
     let client = CyclesClient::new(config);

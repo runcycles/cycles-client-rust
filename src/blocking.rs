@@ -24,17 +24,32 @@ pub mod sync_client {
     impl BlockingCyclesClient {
         /// Create a blocking client from a config.
         pub fn new(config: CyclesConfig) -> Result<Self, Error> {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
                 .enable_all()
                 .build()
                 .map_err(|e| Error::Config(format!("failed to create tokio runtime: {e}")))?;
-            let inner = crate::CyclesClient::new(config);
+            // Construct inside the live multi-thread runtime so automatic
+            // replay starts without making the blocking constructor wait for
+            // a persisted Retry-After floor.
+            let inner = rt.block_on(async { crate::CyclesClient::new(config) });
             Ok(Self { inner, rt })
         }
 
         /// Access the client configuration.
         pub fn config(&self) -> &CyclesConfig {
             self.inner.config()
+        }
+
+        /// Replay unresolved settlements from the durable journal.
+        pub fn flush_pending_commits(&self) -> usize {
+            self.rt.block_on(self.inner.flush_pending_commits())
+        }
+
+        /// Replay unresolved settlements, waiting at most `timeout`.
+        pub fn flush_pending_commits_with_timeout(&self, timeout: std::time::Duration) -> usize {
+            self.rt
+                .block_on(self.inner.flush_pending_commits_with_timeout(timeout))
         }
 
         /// Create a reservation (blocking).

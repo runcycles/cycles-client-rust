@@ -1,6 +1,6 @@
 //! Request types for the Cycles protocol.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::common::{Action, Amount, CyclesMetrics, Subject};
 use super::enums::CommitOveragePolicy;
@@ -37,7 +37,7 @@ pub struct ReservationCreateRequest {
 }
 
 /// Request to commit (record actual spend) against a reservation.
-#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 pub struct CommitRequest {
     /// Idempotency key for safe retries.
     #[builder(default = IdempotencyKey::random())]
@@ -113,7 +113,7 @@ pub struct DecisionRequest {
 }
 
 /// Request to create a direct-debit event (no prior reservation).
-#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 pub struct EventCreateRequest {
     /// Idempotency key for safe retries.
     #[builder(default = IdempotencyKey::random())]

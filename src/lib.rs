@@ -84,6 +84,7 @@ pub(crate) mod constants;
 pub mod error;
 pub mod guard;
 pub(crate) mod heartbeat;
+pub(crate) mod journal;
 pub mod lifecycle;
 pub mod models;
 pub mod response;
