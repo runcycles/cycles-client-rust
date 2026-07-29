@@ -52,6 +52,26 @@ fn journal_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
+struct AssertJournaledThenDelay {
+    journal_root: PathBuf,
+}
+
+impl wiremock::Respond for AssertJournaledThenDelay {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        assert_eq!(
+            journal_files(&self.journal_root).len(),
+            1,
+            "durable record must exist before the first commit request reaches the server"
+        );
+        ResponseTemplate::new(200)
+            .set_delay(Duration::from_millis(250))
+            .set_body_json(json!({
+                "status": "COMMITTED",
+                "charged": {"unit": "USD_MICROCENTS", "amount": 4200}
+            }))
+    }
+}
+
 async fn wait_until_journal_empty(root: &Path) {
     for _ in 0..100 {
         if journal_files(root).is_empty() {
@@ -100,12 +120,12 @@ async fn transient_commit_is_journaled_and_replayed_after_key_rotation() {
 
     Mock::given(method("POST"))
         .and(path("/v1/reservations/rsv_restart/commit"))
-        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
-            "error": "INTERNAL_ERROR",
-            "message": "temporary",
-            "request_id": "req-1"
-        })))
-        .up_to_n_times(2)
+        // The server applies the commit, but the response arrives after the
+        // first client's enforced attempt deadline: a true lost response.
+        .respond_with(AssertJournaledThenDelay {
+            journal_root: journal_dir.path().to_path_buf(),
+        })
+        .up_to_n_times(1)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -117,7 +137,15 @@ async fn transient_commit_is_journaled_and_replayed_after_key_rotation() {
         .mount(&server)
         .await;
 
-    let first = durable_client(&server, journal_dir.path(), "old-key");
+    let first = CyclesClient::builder("old-key", server.uri())
+        .tenant("acme")
+        .journal_dir(journal_dir.path())
+        .retry_enabled(true)
+        .retry_max_attempts(0)
+        .retry_initial_delay(Duration::ZERO)
+        .connect_timeout(Duration::from_millis(50))
+        .read_timeout(Duration::from_millis(50))
+        .build();
     let error = reserve(&first)
         .await
         .commit(commit_request())
@@ -145,14 +173,10 @@ async fn transient_commit_is_journaled_and_replayed_after_key_rotation() {
         .into_iter()
         .filter(|request| request.url.path().ends_with("/commit"))
         .collect::<Vec<_>>();
-    assert_eq!(commits.len(), 3);
+    assert_eq!(commits.len(), 2);
     assert_eq!(
         commits[0].headers.get("X-Idempotency-Key"),
         commits[1].headers.get("X-Idempotency-Key")
-    );
-    assert_eq!(
-        commits[1].headers.get("X-Idempotency-Key"),
-        commits[2].headers.get("X-Idempotency-Key")
     );
 }
 
@@ -253,6 +277,15 @@ async fn rate_limit_retry_floor_is_persisted() {
                     "request_id": "req-limited"
                 })),
         )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations/rsv_limited/commit"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "COMMITTED",
+            "charged": {"unit": "USD_MICROCENTS", "amount": 4200}
+        })))
         .mount(&server)
         .await;
 
@@ -285,6 +318,93 @@ async fn rate_limit_retry_floor_is_persisted() {
     );
     assert!(started.elapsed() < Duration::from_millis(250));
     assert_eq!(journal_files(journal_dir.path()).len(), 1);
+
+    let _restarted = durable_client_with_attempts(&server, journal_dir.path(), "key", 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().ends_with("/commit"))
+            .count(),
+        1,
+        "restart must not retry before the persisted Retry-After floor"
+    );
+    wait_until_journal_empty(journal_dir.path()).await;
+    let commits = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path().ends_with("/commit"))
+        .collect::<Vec<_>>();
+    assert_eq!(commits.len(), 2);
+    assert_eq!(
+        commits[0].headers.get("X-Idempotency-Key"),
+        commits[1].headers.get("X-Idempotency-Key")
+    );
+}
+
+#[tokio::test]
+async fn concurrent_replay_workers_reuse_one_key_and_remove_record() {
+    let server = MockServer::start().await;
+    let journal_dir = tempfile::tempdir().unwrap();
+    mount_reserve_allow(&server, "rsv_concurrent").await;
+    mount_extend(&server, "rsv_concurrent").await;
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations/rsv_concurrent/commit"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "error": "INTERNAL_ERROR",
+            "message": "temporary",
+            "request_id": "req-first"
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations/rsv_concurrent/commit"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(250))
+                .set_body_json(json!({
+                    "status": "COMMITTED",
+                    "charged": {"unit": "USD_MICROCENTS", "amount": 4200}
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let first = durable_client(&server, journal_dir.path(), "key");
+    assert!(matches!(
+        reserve(&first)
+            .await
+            .commit(commit_request())
+            .await
+            .unwrap_err(),
+        Error::CommitPending { .. }
+    ));
+    assert_eq!(journal_files(journal_dir.path()).len(), 1);
+
+    // The delayed success keeps the record present long enough for both
+    // independently constructed workers to load it.
+    let _worker_a = durable_client_with_attempts(&server, journal_dir.path(), "key", 1);
+    let _worker_b = durable_client_with_attempts(&server, journal_dir.path(), "key", 1);
+    wait_until_commit_count(&server, 3).await;
+    wait_until_journal_empty(journal_dir.path()).await;
+
+    let commits = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path().ends_with("/commit"))
+        .collect::<Vec<_>>();
+    assert_eq!(commits.len(), 3);
+    assert!(commits.windows(2).all(|pair| {
+        pair[0].headers.get("X-Idempotency-Key") == pair[1].headers.get("X-Idempotency-Key")
+    }));
 }
 
 #[tokio::test]

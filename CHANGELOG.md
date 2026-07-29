@@ -38,6 +38,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   fallback accepts only a schema-valid HTTP 201 `APPLIED` response. Other 2xx
   outcomes remain ambiguous, reuse the original key, and keep the durable
   record instead of being mistaken for terminal success.
+- Corrupt, semantically invalid, and unsupported-version journal records are
+  quarantined without blocking valid replay, and the shared
+  recovery-conformance adapter reports the exact native test it executed.
 - A 429 retry floor is persisted before the retry sleep and as an absolute
   `not_before_ms`, so restarting mid-wait cannot violate `Retry-After`.
 - Expired commits persist the journal's event mode before

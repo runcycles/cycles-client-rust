@@ -442,19 +442,34 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_records_are_quarantined_without_blocking_valid_records() {
+    #[tracing_test::traced_test]
+    fn corrupt_and_unsupported_records_are_quarantined_without_blocking_valid_records() {
         let temp = tempfile::tempdir().unwrap();
         let journal = CommitJournal {
             directory: temp.path().join("journal"),
         };
         fs::create_dir_all(&journal.directory).unwrap();
         fs::write(journal.directory.join("bad.json"), "{not-json").unwrap();
+        let mut future = pending("future");
+        future.version = 2;
+        fs::write(
+            journal.directory.join("future.json"),
+            serde_json::to_string(&future).unwrap(),
+        )
+        .unwrap();
+        fs::write(journal.directory.join("array.json"), "[]").unwrap();
         journal.record(&pending("good")).unwrap();
 
         let loaded = journal.load_pending("http://localhost");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].reservation_id, "good");
         assert!(journal.directory.join("bad.corrupt").exists());
+        assert!(journal.directory.join("future.corrupt").exists());
+        assert!(journal.directory.join("array.corrupt").exists());
+        assert!(logs_contain(
+            "skipping corrupt pending-commit journal entry"
+        ));
+        assert!(logs_contain("future.json"));
     }
 
     #[test]
