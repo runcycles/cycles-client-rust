@@ -180,6 +180,49 @@ fn deserialization_error_not_retryable() {
 }
 
 #[test]
+fn commit_pending_is_distinct_from_a_retryable_terminal_error() {
+    let pending = Error::CommitPending {
+        reservation_id: "rsv_pending".to_string(),
+        last_error: Box::new(Error::Api {
+            status: 503,
+            code: Some(ErrorCode::InternalError),
+            message: "temporary".to_string(),
+            request_id: None,
+            retry_after: None,
+            details: None,
+        }),
+    };
+    assert!(!pending.is_retryable());
+    assert!(pending.to_string().contains("durably journaled"));
+    assert!(pending.to_string().contains("rsv_pending"));
+}
+
+#[test]
+fn recovery_wrappers_preserve_the_latest_retry_after() {
+    let retry_after = Duration::from_secs(7);
+    let event_error = Error::Api {
+        status: 429,
+        code: Some(ErrorCode::LimitExceeded),
+        message: "slow down".into(),
+        request_id: None,
+        retry_after: Some(retry_after),
+        details: None,
+    };
+    let recovery = Error::CommitRecoveryFailed {
+        reservation_id: "rsv_retry_after".into(),
+        commit_error: Box::new(Error::Validation("expired".into())),
+        event_error: Box::new(event_error),
+    };
+    assert_eq!(recovery.retry_after(), Some(retry_after));
+
+    let pending = Error::CommitPending {
+        reservation_id: "rsv_retry_after".into(),
+        last_error: Box::new(recovery),
+    };
+    assert_eq!(pending.retry_after(), Some(retry_after));
+}
+
+#[test]
 fn error_display() {
     let err = Error::BudgetExceeded {
         message: "Over budget".into(),

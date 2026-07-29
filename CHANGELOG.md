@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.2] - 2026-07-28
+
+### Added
+
+- **Durable pending-commit journal.** Once actual usage is known,
+  `ReservationGuard::commit` atomically records the commit and its
+  expiry-to-event fallback before the first network attempt. Pending records
+  survive retry exhaustion, authentication failure, ambiguous 4xx responses,
+  cancellation, and process restart; successful or genuinely terminal
+  outcomes remove them.
+- Journal records use the Python/TypeScript/Java version-1 wire shape and
+  PBKDF2 identity fingerprint. Tenant partitions remain stable across API-key
+  rotation, no credential is stored, Unix directories/files are restricted to
+  `0700`/`0600`, malformed records are quarantined, and concurrent replay is
+  safe through the stored idempotency key.
+- Journal filenames use `v2-<sha256(exact UTF-8 reservation id)>.json`, safely
+  migrate matching legacy records, and preserve collision-free cross-SDK
+  replay.
+- Automatic replay starts when an async client is constructed inside Tokio;
+  the blocking client owns a worker that starts replay without blocking its
+  constructor. Both clients expose `flush_pending_commits` and bounded
+  `flush_pending_commits_with_timeout` operations.
+- `CyclesConfig::{journal_enabled,journal_dir}`, matching builder setters and
+  `CYCLES_JOURNAL_ENABLED` / `CYCLES_JOURNAL_DIR` environment variables.
+- `Error::CommitPending` distinguishes a durably queued, unresolved settlement
+  from a genuine terminal failure. Callers must not compensate it with a new
+  key.
+
+### Fixed
+
+- Commit accepts only a schema-valid HTTP 200 `COMMITTED` response and event
+  fallback accepts only a schema-valid HTTP 201 `APPLIED` response. Other 2xx
+  outcomes remain ambiguous, reuse the original key, and keep the durable
+  record instead of being mistaken for terminal success.
+- Corrupt, semantically invalid, and unsupported-version journal records are
+  quarantined without blocking valid replay, and the shared
+  recovery-conformance adapter reports the exact native test it executed.
+- A 429 retry floor is persisted before the retry sleep and as an absolute
+  `not_before_ms`, so restarting mid-wait cannot violate `Retry-After`.
+- Expired commits persist the journal's event mode before
+  `POST /v1/events`; a crash cannot make replay return to a doomed commit.
+- Pull-request and release CI run every shared durable-recovery and
+  guarantee-boundary scenario, and publishing is gated on conformance.
+
+### Compatibility
+
+- Adding `Error::CommitPending` and two public `CyclesConfig` fields requires
+  downstream exhaustive matches/struct literals to add the new members.
+
 ## [0.3.1] - 2026-07-27
 
 Heartbeat extend-drift fix (P1 liveness, fleet-wide — same bug in all four SDKs), refined under five rounds of adversarial + spec review and a final spec-alignment pass: alternate-beat → lead-estimate → grant-ledger → grant-ledger with immediate first beat and lead-clamp regime (v2.3) → **server-authoritative `remaining_ttl_ms` scheduling per the spec's HEARTBEAT GUIDANCE (spec PR #148, head `dd60c27`), with the v2.3 heuristic as fallback**.

@@ -68,6 +68,24 @@ pub enum Error {
         event_error: Box<Error>,
     },
 
+    /// Actual spend is durably journaled but its server-side settlement is
+    /// still unresolved.
+    ///
+    /// The SDK will replay this record with the same idempotency key on a
+    /// later client startup or explicit
+    /// [`CyclesClient::flush_pending_commits`](crate::CyclesClient::flush_pending_commits).
+    /// Callers MUST NOT issue compensating settlement with a different key.
+    #[error(
+        "commit for reservation {reservation_id} is unresolved but durably journaled for replay: \
+         {last_error}"
+    )]
+    CommitPending {
+        /// The reservation whose actual spend remains unresolved.
+        reservation_id: String,
+        /// The most recent commit or event-fallback error.
+        last_error: Box<Error>,
+    },
+
     /// Failed to deserialize the response body.
     #[error("failed to deserialize response: {0}")]
     Deserialization(#[source] serde_json::Error),
@@ -109,7 +127,7 @@ impl Error {
             // Final by construction: both the commit path (including its
             // inline retry) and the event fallback (including its own bounded
             // retry) have already run to completion.
-            Self::CommitRecoveryFailed { .. } => false,
+            Self::CommitRecoveryFailed { .. } | Self::CommitPending { .. } => false,
             Self::Deserialization(_) | Self::Config(_) | Self::Validation(_) => false,
         }
     }
@@ -181,6 +199,8 @@ impl Error {
         match self {
             Self::Api { retry_after, .. } => *retry_after,
             Self::BudgetExceeded { retry_after, .. } => *retry_after,
+            Self::CommitRecoveryFailed { event_error, .. } => event_error.retry_after(),
+            Self::CommitPending { last_error, .. } => last_error.retry_after(),
             _ => None,
         }
     }

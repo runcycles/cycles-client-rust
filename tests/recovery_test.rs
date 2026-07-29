@@ -22,6 +22,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn test_client(server: &MockServer) -> CyclesClient {
     CyclesClient::builder("key", server.uri())
+        .journal_enabled(false)
         .retry_enabled(true)
         .retry_max_attempts(3)
         .retry_initial_delay(Duration::from_millis(10))
@@ -72,7 +73,7 @@ async fn expired_commit_recovers_via_event() {
 
     Mock::given(method("POST"))
         .and(path("/v1/events"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "status": "APPLIED",
             "event_id": "evt_rec_1",
             "charged": {"unit": "USD_MICROCENTS", "amount": 4200}
@@ -147,7 +148,7 @@ async fn expired_commit_preserves_non_object_metadata() {
 
     Mock::given(method("POST"))
         .and(path("/v1/events"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "status": "APPLIED",
             "event_id": "evt_meta"
         })))
@@ -256,7 +257,7 @@ async fn event_fallback_retries_transient_failures_with_same_key() {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/events"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "status": "APPLIED",
             "event_id": "evt_rec_3"
         })))
@@ -455,7 +456,7 @@ async fn commit_410_with_mangled_body_still_recovers_via_event() {
 
     Mock::given(method("POST"))
         .and(path("/v1/events"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "status": "APPLIED",
             "event_id": "evt_410"
         })))
@@ -485,15 +486,15 @@ async fn event_fallback_rejects_non_applied_status_as_recovery() {
     mount_extend(&server, "rsv_nap").await;
     mount_commit_expired(&server, "rsv_nap").await;
 
-    // HTTP 200 whose status is not APPLIED (an unknown future value): NOT
+    // HTTP 201 whose status is not APPLIED (an unknown future value): NOT
     // proof the spend was recorded — must be treated as recovery failure.
     Mock::given(method("POST"))
         .and(path("/v1/events"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "status": "PENDING_SETTLEMENT",
             "event_id": "evt_pending"
         })))
-        .expect(1)
+        .expect(4)
         .mount(&server)
         .await;
 
@@ -520,13 +521,19 @@ async fn event_fallback_rejects_non_applied_status_as_recovery() {
             );
             let event_msg = event_error.to_string();
             assert!(
-                event_msg.contains("unexpected status"),
-                "event error must convey the unexpected status: {event_msg}"
+                event_msg.contains("not schema-valid"),
+                "event error must convey the invalid success body: {event_msg}"
             );
-            assert!(event_msg.contains("Unknown"));
         }
         other => panic!("expected CommitRecoveryFailed, got {other:?}"),
     }
+    let events = calls_to(&server, "/v1/events").await;
+    assert_eq!(events.len(), 4);
+    let keys = events
+        .iter()
+        .map(|request| request.headers.get("X-Idempotency-Key"))
+        .collect::<Vec<_>>();
+    assert!(keys.windows(2).all(|pair| pair[0] == pair[1]));
     assert!(!err.is_retryable());
 }
 

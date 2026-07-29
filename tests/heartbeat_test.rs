@@ -742,6 +742,75 @@ async fn heartbeat_fallback_unknown_status_retries_with_same_key() {
     guard.release("test done").await.unwrap();
 }
 
+/// A request that reaches the server but times out before its response is a
+/// transport failure. It must be observable, retry with the same key, leave
+/// the guarded work alive, and still permit final settlement.
+#[tokio::test]
+async fn heartbeat_transport_timeout_is_observable_nonfatal_and_same_key() {
+    let server = MockServer::start().await;
+    let rsv_id = "rsv_hb_transport";
+    const TTL: u64 = 2_000;
+    mount_reserve(&server, rsv_id, initial_expiry(TTL)).await;
+    Mock::given(method("POST"))
+        .and(path(extend_path(rsv_id)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(250))
+                .set_body_json(json!({
+                    "status": "ACTIVE",
+                    "expires_at_ms": initial_expiry(TTL) + TTL
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/reservations/{rsv_id}/commit")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "COMMITTED",
+            "charged": {"unit": "USD_MICROCENTS", "amount": 5000}
+        })))
+        .mount(&server)
+        .await;
+
+    let client = CyclesClient::builder("key", server.uri())
+        .connect_timeout(Duration::from_millis(50))
+        .read_timeout(Duration::from_millis(50))
+        .build();
+    let request = ReservationCreateRequest::builder()
+        .subject(Subject {
+            tenant: Some("acme".into()),
+            ..Default::default()
+        })
+        .action(Action::new("llm.completion", "gpt-4o"))
+        .estimate(Amount::usd_microcents(5000))
+        .ttl_ms(TTL)
+        .build();
+    let guard = client.reserve(request).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1_450)).await;
+    let bodies = extend_bodies(&server, rsv_id, TTL).await;
+    assert!(bodies.len() >= 2);
+    assert_eq!(bodies[0]["idempotency_key"], bodies[1]["idempotency_key"]);
+
+    guard
+        .commit(
+            CommitRequest::builder()
+                .idempotency_key(IdempotencyKey::new("commit-after-heartbeat"))
+                .actual(Amount::usd_microcents(5000))
+                .build(),
+        )
+        .await
+        .unwrap();
+    let commit_count = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path().ends_with("/commit"))
+        .count();
+    assert_eq!(commit_count, 1);
+}
+
 // ─── Normative scheduling: remaining_ttl_ms (spec PR #148) ───────────────
 //
 // Field-mode numbers used throughout: the client below enforces a small

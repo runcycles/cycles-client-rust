@@ -18,12 +18,12 @@ pub(crate) const RETRY_AFTER_CAP: Duration = Duration::from_secs(3600);
 ///
 /// Wired into [`ReservationGuard::commit`](crate::guard::ReservationGuard::commit):
 /// when the initial commit attempt fails with a retryable error, the guard
-/// awaits [`retry`](Self::retry) inline until the commit succeeds, fails with
+/// awaits [`retry_observed`](Self::retry_observed) inline until the commit succeeds, fails with
 /// a non-retryable error, or attempts are exhausted. Retries reuse the
 /// original [`CommitRequest`] — same idempotency key — so a commit that landed
 /// server-side but failed on the response path cannot double-charge. Running
-/// inline (not in a detached task) keeps `commit()`'s contract exact: once it
-/// returns `Err`, no further commit attempt will ever be made.
+/// inline avoids racing the live reservation heartbeat. If inline recovery
+/// exhausts, the guard's durable journal owns later same-key replay.
 #[derive(Debug, Clone)]
 pub(crate) struct CommitRetryEngine {
     enabled: bool,
@@ -51,6 +51,7 @@ impl CommitRetryEngine {
     /// `first_error` is the error from the initial attempt; it is returned
     /// unchanged when retry is disabled. On exhaustion the most recent error
     /// is returned.
+    #[cfg(test)]
     pub async fn retry(
         &self,
         client: &CyclesClient,
@@ -58,59 +59,41 @@ impl CommitRetryEngine {
         commit_request: &CommitRequest,
         first_error: Error,
     ) -> Result<CommitResponse, Error> {
+        self.retry_observed(client, reservation_id, commit_request, first_error, |_| {})
+            .await
+    }
+
+    /// Retry a commit while synchronously observing each failure before its
+    /// delay. The durable journal uses this to persist a 429 retry floor
+    /// before sleeping, so process death cannot erase the server's timing
+    /// instruction.
+    pub async fn retry_observed(
+        &self,
+        client: &CyclesClient,
+        reservation_id: &ReservationId,
+        commit_request: &CommitRequest,
+        first_error: Error,
+        mut observe: impl FnMut(&Error),
+    ) -> Result<CommitResponse, Error> {
         if !self.enabled {
             return Err(first_error);
         }
 
-        tracing::debug!(
-            reservation_id = %reservation_id,
-            max_attempts = self.max_attempts,
-            error = %first_error,
-            "commit failed with retryable error; retrying with backoff"
-        );
-
         let mut last_error = first_error;
         for attempt in 0..self.max_attempts {
+            observe(&last_error);
             tokio::time::sleep(self.delay_for(attempt, &last_error)).await;
 
             match client
                 .commit_reservation(reservation_id, commit_request)
                 .await
             {
-                Ok(resp) => {
-                    tracing::debug!(
-                        reservation_id = %reservation_id,
-                        attempt = attempt + 1,
-                        "commit retry succeeded"
-                    );
-                    return Ok(resp);
-                }
-                Err(e) if !e.is_retryable() => {
-                    tracing::warn!(
-                        reservation_id = %reservation_id,
-                        attempt = attempt + 1,
-                        error = %e,
-                        "commit retry hit non-retryable error, stopping"
-                    );
-                    return Err(e);
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        reservation_id = %reservation_id,
-                        attempt = attempt + 1,
-                        error = %e,
-                        "commit retry attempt failed, will retry"
-                    );
-                    last_error = e;
-                }
+                Ok(resp) => return Ok(resp),
+                Err(e) if !crate::client::is_settlement_retryable(&e) => return Err(e),
+                Err(e) => last_error = e,
             }
         }
 
-        tracing::warn!(
-            reservation_id = %reservation_id,
-            attempts = self.max_attempts,
-            "commit retry exhausted"
-        );
         Err(last_error)
     }
 
@@ -124,62 +107,41 @@ impl CommitRetryEngine {
     /// into unrecorded spend. Retries reuse the original
     /// [`EventCreateRequest`] — same idempotency key — so an event that
     /// already landed server-side cannot double-charge.
+    #[cfg(test)]
     pub async fn retry_event(
         &self,
         client: &CyclesClient,
         event_request: &EventCreateRequest,
         first_error: Error,
     ) -> Result<EventCreateResponse, Error> {
+        self.retry_event_observed(client, event_request, first_error, |_| {})
+            .await
+    }
+
+    /// Event-fallback counterpart to [`retry_observed`](Self::retry_observed).
+    pub async fn retry_event_observed(
+        &self,
+        client: &CyclesClient,
+        event_request: &EventCreateRequest,
+        first_error: Error,
+        mut observe: impl FnMut(&Error),
+    ) -> Result<EventCreateResponse, Error> {
         if !self.enabled {
             return Err(first_error);
         }
 
-        tracing::debug!(
-            idempotency_key = %event_request.idempotency_key,
-            max_attempts = self.max_attempts,
-            error = %first_error,
-            "fallback event failed with retryable error; retrying with backoff"
-        );
-
         let mut last_error = first_error;
         for attempt in 0..self.max_attempts {
+            observe(&last_error);
             tokio::time::sleep(self.delay_for(attempt, &last_error)).await;
 
             match client.create_event(event_request).await {
-                Ok(resp) => {
-                    tracing::debug!(
-                        idempotency_key = %event_request.idempotency_key,
-                        attempt = attempt + 1,
-                        "fallback event retry succeeded"
-                    );
-                    return Ok(resp);
-                }
-                Err(e) if !e.is_retryable() => {
-                    tracing::warn!(
-                        idempotency_key = %event_request.idempotency_key,
-                        attempt = attempt + 1,
-                        error = %e,
-                        "fallback event retry hit non-retryable error, stopping"
-                    );
-                    return Err(e);
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        idempotency_key = %event_request.idempotency_key,
-                        attempt = attempt + 1,
-                        error = %e,
-                        "fallback event retry attempt failed, will retry"
-                    );
-                    last_error = e;
-                }
+                Ok(resp) => return Ok(resp),
+                Err(e) if !crate::client::is_settlement_retryable(&e) => return Err(e),
+                Err(e) => last_error = e,
             }
         }
 
-        tracing::warn!(
-            idempotency_key = %event_request.idempotency_key,
-            attempts = self.max_attempts,
-            "fallback event retry exhausted"
-        );
         Err(last_error)
     }
 
@@ -231,6 +193,8 @@ mod tests {
             retry_initial_delay: Duration::from_millis(1),
             retry_multiplier: 2.0,
             retry_max_delay: Duration::from_secs(5),
+            journal_enabled: false,
+            journal_dir: None,
         }
     }
 
@@ -482,7 +446,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/v1/events"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "status": "APPLIED",
                 "event_id": "evt_ok"
             })))

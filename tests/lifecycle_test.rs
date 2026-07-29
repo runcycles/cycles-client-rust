@@ -8,7 +8,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn setup() -> (MockServer, CyclesClient) {
     let server = MockServer::start().await;
-    let client = CyclesClient::builder("test-key", server.uri()).build();
+    let client = CyclesClient::builder("test-key", server.uri())
+        .journal_enabled(false)
+        .build();
     (server, client)
 }
 
@@ -105,6 +107,10 @@ async fn with_cycles_error_releases_automatically() {
         Error::Validation(msg) => assert!(msg.contains("guarded function failed")),
         _ => panic!("expected Validation error, got: {err:?}"),
     }
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.iter().any(|request| {
+        request.url.path().ends_with("/commit") || request.url.path() == "/v1/events"
+    }));
 }
 
 #[tokio::test]

@@ -19,6 +19,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn test_client(server: &MockServer, retry_enabled: bool) -> CyclesClient {
     CyclesClient::builder("key", server.uri())
+        .journal_enabled(false)
         .retry_enabled(retry_enabled)
         .retry_max_attempts(3)
         .retry_initial_delay(Duration::from_millis(10))

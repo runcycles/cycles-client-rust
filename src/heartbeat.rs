@@ -770,12 +770,7 @@ pub(crate) fn start_heartbeat(
                     last_recovery_window = Some(window);
                     last_recovery_failure_at = Some(failure_at);
                     next_beat = tokio::time::Instant::now() + Duration::from_millis(retry_delay_ms);
-                    tracing::warn!(
-                        reservation_id = %reservation_id,
-                        error = %e,
-                        retry_delay_ms,
-                        "heartbeat extend failed; retrying with the same idempotency key within the recovery window"
-                    );
+                    warn_field_retry(&reservation_id, &e, retry_delay_ms);
                 }
                 Err(e) => {
                     // Fallback: keep the key (the retry must dedupe against
@@ -783,15 +778,28 @@ pub(crate) fn start_heartbeat(
                     // the current cadence.
                     pending_key = Some(key);
                     next_beat = advance(next_beat, delay);
-                    tracing::warn!(
-                        reservation_id = %reservation_id,
-                        error = %e,
-                        "heartbeat extend failed; retrying next beat with the same idempotency key"
-                    );
+                    warn_fallback_retry(&reservation_id, &e);
                 }
             }
         }
     })
+}
+
+fn warn_field_retry(reservation_id: &ReservationId, error: &crate::Error, retry_delay_ms: u64) {
+    tracing::warn!(
+        reservation_id = %reservation_id,
+        error = %error,
+        retry_delay_ms,
+        "heartbeat extend failed; retrying with the same idempotency key within the recovery window"
+    );
+}
+
+fn warn_fallback_retry(reservation_id: &ReservationId, error: &crate::Error) {
+    tracing::warn!(
+        reservation_id = %reservation_id,
+        error = %error,
+        "heartbeat extend failed; retrying next beat with the same idempotency key"
+    );
 }
 
 #[cfg(test)]
@@ -799,6 +807,19 @@ mod tests {
     use super::*;
 
     const REQUESTED: u64 = 2_000;
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn fallback_retry_warning_includes_reservation_and_disposition() {
+        warn_fallback_retry(
+            &ReservationId::new("rsv-observable"),
+            &crate::Error::Validation("socket timed out".to_string()),
+        );
+        assert!(logs_contain("rsv-observable"));
+        assert!(logs_contain(
+            "heartbeat extend failed; retrying next beat with the same idempotency key"
+        ));
+    }
 
     #[test]
     fn lead_min_starts_at_zero_and_goes_negative() {
