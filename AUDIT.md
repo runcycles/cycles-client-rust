@@ -1,5 +1,11 @@
 # Protocol Conformance Audit — Rust Client
 
+- **Date:** 2026-07-30 (no runtime change — durable recovery CI now emits and
+  uploads the profile 0.3 machine-readable evidence report even on failure,
+  and the README links its recovery-conformance badge to the public SDK
+  matrix. The report binds all 12 scenarios and exact native tests to the SDK
+  commit, protocol commit, catalog digest, and Actions run.),
+
 - **Date:** 2026-07-28 (v0.3.2 — durable pending-commit journal aligned with
   the cross-SDK recovery profile. Actual spend is atomically journaled before
   the first commit request; retry/auth/ambiguous outcomes survive restart;

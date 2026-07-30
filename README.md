@@ -1,6 +1,7 @@
 [![Crates.io](https://img.shields.io/crates/v/runcycles)](https://crates.io/crates/runcycles)
 [![docs.rs](https://img.shields.io/docsrs/runcycles)](https://docs.rs/runcycles)
 [![CI](https://github.com/runcycles/cycles-client-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/runcycles/cycles-client-rust/actions)
+[![Recovery conformance](https://img.shields.io/github/actions/workflow/status/runcycles/cycles-client-rust/ci.yml?branch=main&label=recovery%20conformance)](https://runcycles.io/protocol/sdk-recovery-conformance)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Coverage](https://img.shields.io/badge/coverage-95%25-brightgreen)](https://github.com/runcycles/cycles-client-rust/actions)
 
