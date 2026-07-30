@@ -37,14 +37,14 @@ jobs:
           --claim durable
           --report-json recovery-conformance.json
           --implementation runcycles/cycles-client-rust
-          --implementation-commit ${{ github.sha }}
+          --implementation-commit ${{ github.event.pull_request.head.sha || github.sha }}
           --evidence-url https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           --adapter python scripts/recovery_conformance_adapter.py
       - name: Upload recovery conformance evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: recovery-conformance-${{ github.sha }}
+          name: recovery-conformance-${{ github.event.pull_request.head.sha || github.sha }}
           path: recovery-conformance.json
           if-no-files-found: error
           retention-days: 90
