@@ -203,8 +203,12 @@ impl CommitJournal {
 
     fn path_for(&self, reservation_id: &str) -> PathBuf {
         let digest = Sha256::digest(reservation_id.as_bytes());
+        let digest_hex = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         self.directory
-            .join(format!("v2-{digest:x}{JOURNAL_SUFFIX}"))
+            .join(format!("v2-{digest_hex}{JOURNAL_SUFFIX}"))
     }
 
     fn legacy_path_for(&self, reservation_id: &str) -> PathBuf {
@@ -423,6 +427,13 @@ mod tests {
         };
         journal.record(&pending("rsv/a")).unwrap();
         journal.record(&pending("rsv_a")).unwrap();
+        assert_eq!(
+            journal
+                .path_for("rsv/a")
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("v2-e3edb9ca022de3c9c90c5667d47fa66448cee1f254e488a761313faee34141d7.json")
+        );
         assert_ne!(journal.path_for("rsv/a"), journal.path_for("rsv_a"));
         assert!(journal.path_for("rsv/a").exists());
         assert!(journal.path_for("rsv_a").exists());
