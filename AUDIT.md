@@ -1,5 +1,10 @@
 # Protocol Conformance Audit — Rust Client
 
+- **Date:** 2026-09-01 (dependency maintenance — `uuid` 1.24.1 → 1.26.0;
+  transitive `h2` 0.4.13 → 0.4.16 resolves RUSTSEC-2026-0258, and
+  `chacha20` 0.10.1 → 0.10.2 replaces the yanked release. No source or
+  protocol behavior changes.),
+
 - **Date:** 2026-07-30 (no runtime change — durable recovery CI now emits and
   uploads the profile 0.3 machine-readable evidence report even on failure,
   and the README links its recovery-conformance badge to the public SDK
