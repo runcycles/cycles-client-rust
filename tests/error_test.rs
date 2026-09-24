@@ -406,3 +406,40 @@ fn auth_errors_are_distinct_and_non_retryable() {
     assert!(!not_auth.is_auth_error());
     assert!(!Error::Validation("bad".into()).is_auth_error());
 }
+
+#[test]
+fn client_side_errors_preserve_diagnostics_and_sources() {
+    use std::error::Error as StdError;
+
+    let transport: Error = reqwest::Client::new()
+        .get("not a valid URL")
+        .build()
+        .unwrap_err()
+        .into();
+    assert!(transport.is_retryable());
+    assert!(transport.to_string().starts_with("HTTP transport error:"));
+    assert!(StdError::source(&transport).is_some());
+    assert_eq!(transport.status(), None);
+
+    let decode = Error::Deserialization(serde_json::from_str::<String>("{").unwrap_err());
+    assert!(decode
+        .to_string()
+        .starts_with("failed to deserialize response:"));
+    assert!(StdError::source(&decode).is_some());
+    assert!(!decode.is_retryable());
+
+    for (error, expected) in [
+        (
+            Error::Config("invalid endpoint".into()),
+            "invalid configuration: invalid endpoint",
+        ),
+        (
+            Error::Validation("missing subject".into()),
+            "invalid request: missing subject",
+        ),
+    ] {
+        assert_eq!(error.to_string(), expected);
+        assert!(StdError::source(&error).is_none());
+        assert!(!error.is_retryable());
+    }
+}

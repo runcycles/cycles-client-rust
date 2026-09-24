@@ -9,8 +9,13 @@ resolve RUSTSEC-2026-0285, which blocked the dependency PR security audit.
 Reference: https://rustsec.org/advisories/RUSTSEC-2026-0285.html
 
 SDK source, public APIs, protocol fixtures, and the Rust 1.88 MSRV remain
-unchanged. Stable/MSRV tests, durable recovery conformance, coverage, and
-cargo audit remain required validation for the consolidated update.
+unchanged. Added regression coverage for client debug credential redaction,
+error diagnostic/source preservation, malformed successful GET/POST bodies,
+and status/retry metadata on non-JSON gateway errors.
+The previous 94.16% line-coverage baseline fell below the repository requirement;
+`tarpaulin.toml` now enforces a 95% minimum without excluding source files.
+Stable/MSRV tests, durable recovery conformance, coverage, and cargo audit
+remain required validation for the consolidated update.
 
 - **Date:** 2026-09-01 (dependency maintenance — `uuid` 1.24.1 → 1.26.0;
   transitive `h2` 0.4.13 → 0.4.16 resolves RUSTSEC-2026-0258, and

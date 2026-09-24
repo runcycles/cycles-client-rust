@@ -1472,3 +1472,69 @@ async fn create_reservation_404_other_not_found_is_not_enriched() {
         other => panic!("expected Api error, got {other:?}"),
     }
 }
+
+#[test]
+fn client_debug_preserves_endpoint_without_exposing_credentials() {
+    let client = CyclesClient::builder("secret-not-for-logs", "https://cycles.example")
+        .journal_enabled(false)
+        .build();
+    let output = format!("{client:?}");
+    assert!(output.contains("https://cycles.example"));
+    assert!(!output.contains("secret-not-for-logs"));
+    assert!(!output.contains("api_key"));
+}
+
+#[tokio::test]
+async fn malformed_success_bodies_are_decoding_errors_for_get_and_post() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/reservations/rsv_bad_body"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/reservations/rsv_bad_body/release"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let id = ReservationId::new("rsv_bad_body");
+    let get_error = client.get_reservation(&id).await.unwrap_err();
+    let post_error = client
+        .release_reservation(&id, &ReleaseRequest::new(None))
+        .await
+        .unwrap_err();
+    for error in [get_error, post_error] {
+        assert!(matches!(error, Error::Deserialization(_)));
+        assert!(!error.is_retryable());
+        assert_eq!(error.status(), None);
+    }
+}
+
+#[tokio::test]
+async fn get_error_with_non_json_body_preserves_status_and_header_metadata() {
+    let (server, client) = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/reservations/rsv_unavailable"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_string("upstream unavailable")
+                .insert_header("x-request-id", "req-proxy")
+                .insert_header("retry-after", "3"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client
+        .get_reservation(&ReservationId::new("rsv_unavailable"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.status(), Some(503));
+    assert_eq!(error.request_id(), Some("req-proxy"));
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(3)));
+    assert_eq!(error.error_code(), None);
+    assert!(error.is_retryable());
+    assert!(matches!(error, Error::Api { message, .. } if message == "HTTP 503"));
+}
