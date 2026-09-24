@@ -1,0 +1,3 @@
+# Keep the repository coverage requirement enforced by the reusable CI job.
+[default]
+fail-under = 95.0

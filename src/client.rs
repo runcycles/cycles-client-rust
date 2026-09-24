@@ -1397,6 +1397,43 @@ mod tests {
     }
 
     #[test]
+    fn strict_create_rejects_malformed_nested_protocol_fields() {
+        let valid = json!({
+            "decision": "ALLOW",
+            "reservation_id": "rsv_nested",
+            "affected_scopes": ["tenant:acme"]
+        });
+        assert!(is_schema_valid_create_body(&valid));
+        for (field, value) in [
+            ("reserved", json!(null)),
+            ("caps", json!({"unexpected": true})),
+            ("balances", json!([null])),
+            ("cycles_evidence", json!(null)),
+            ("cycles_evidence", json!({"evidence_id": "a".repeat(64)})),
+        ] {
+            let mut response = valid.clone();
+            response[field] = value;
+            assert!(!is_schema_valid_create_body(&response), "{response}");
+        }
+    }
+
+    #[test]
+    fn strict_success_validators_reject_non_object_json() {
+        for value in [
+            json!(null),
+            json!([]),
+            json!(true),
+            json!("ALLOW"),
+            json!(0),
+        ] {
+            assert!(!is_schema_valid_create_body(&value), "create: {value}");
+            assert!(!is_schema_valid_extend_body(&value), "extend: {value}");
+            assert!(!is_schema_valid_commit_body(&value), "commit: {value}");
+            assert!(!is_schema_valid_event_body(&value), "event: {value}");
+        }
+    }
+
+    #[test]
     fn strict_lease_response_validators_cover_full_nested_schema() {
         let balance = json!({
             "scope": "tenant:acme",
