@@ -1,5 +1,17 @@
 # Protocol Conformance Audit — Rust Client
 
+## 2026-09-24 — Dependency maintenance
+
+Consolidates Dependabot PRs #92 and #91: the async-openai development
+dependency moves from 0.41.3 to 0.42.0 and the SHA-pinned CodeQL uploader
+moves to 4.38.0. Updates the locked rustls release to at least 0.23.45 to
+resolve RUSTSEC-2026-0285, which blocked the dependency PR security audit.
+Reference: https://rustsec.org/advisories/RUSTSEC-2026-0285.html
+
+SDK source, public APIs, protocol fixtures, and the Rust 1.88 MSRV remain
+unchanged. Stable/MSRV tests, durable recovery conformance, coverage, and
+cargo audit remain required validation for the consolidated update.
+
 - **Date:** 2026-09-01 (dependency maintenance — `uuid` 1.24.1 → 1.26.0;
   transitive `h2` 0.4.13 → 0.4.16 resolves RUSTSEC-2026-0258, and
   `chacha20` 0.10.1 → 0.10.2 replaces the yanked release. No source or
