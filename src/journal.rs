@@ -522,6 +522,52 @@ mod tests {
     }
 
     #[test]
+    #[tracing_test::traced_test]
+    fn legacy_migration_preserves_records_when_destination_has_another_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = CommitJournal {
+            directory: temp.path().to_path_buf(),
+        };
+        let record = pending("rsv/legacy");
+        let source = journal.legacy_path_for(&record.reservation_id);
+        let destination = journal.path_for(&record.reservation_id);
+        let legacy_bytes = serde_json::to_string(&record).unwrap();
+        let existing_bytes = serde_json::to_string(&pending("rsv_other")).unwrap();
+        fs::write(&source, &legacy_bytes).unwrap();
+        fs::write(&destination, &existing_bytes).unwrap();
+
+        assert!(!journal.migrate_legacy_path(&source, &record));
+        assert_eq!(fs::read_to_string(&source).unwrap(), legacy_bytes);
+        assert_eq!(fs::read_to_string(&destination).unwrap(), existing_bytes);
+        assert!(logs_contain(
+            "could not safely migrate legacy journal filename"
+        ));
+    }
+
+    #[test]
+    fn legacy_only_record_migrates_and_matching_legacy_copy_is_discarded() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = CommitJournal {
+            directory: temp.path().to_path_buf(),
+        };
+        let record = pending("rsv/legacy");
+        let source = journal.legacy_path_for(&record.reservation_id);
+        let destination = journal.path_for(&record.reservation_id);
+        let bytes = serde_json::to_string(&record).unwrap();
+        fs::write(&source, &bytes).unwrap();
+        let loaded = journal.load_pending("http://localhost");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].reservation_id, record.reservation_id);
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), bytes);
+
+        fs::write(&source, &bytes).unwrap();
+        journal.discard(&record.reservation_id).unwrap();
+        assert!(!source.exists());
+        assert!(!destination.exists());
+    }
+
+    #[test]
     fn wrong_server_records_are_ignored_and_missing_discard_is_safe() {
         let temp = tempfile::tempdir().unwrap();
         let journal = CommitJournal {
