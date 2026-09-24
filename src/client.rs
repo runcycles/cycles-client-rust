@@ -1397,6 +1397,22 @@ mod tests {
     }
 
     #[test]
+    fn strict_success_validators_reject_non_object_json() {
+        for value in [
+            json!(null),
+            json!([]),
+            json!(true),
+            json!("ALLOW"),
+            json!(0),
+        ] {
+            assert!(!is_schema_valid_create_body(&value), "create: {value}");
+            assert!(!is_schema_valid_extend_body(&value), "extend: {value}");
+            assert!(!is_schema_valid_commit_body(&value), "commit: {value}");
+            assert!(!is_schema_valid_event_body(&value), "event: {value}");
+        }
+    }
+
+    #[test]
     fn strict_lease_response_validators_cover_full_nested_schema() {
         let balance = json!({
             "scope": "tenant:acme",

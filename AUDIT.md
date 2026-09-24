@@ -11,7 +11,8 @@ Reference: https://rustsec.org/advisories/RUSTSEC-2026-0285.html
 SDK source, public APIs, protocol fixtures, and the Rust 1.88 MSRV remain
 unchanged. Added regression coverage for client debug credential redaction,
 error diagnostic/source preservation, malformed successful GET/POST bodies,
-and status/retry metadata on non-JSON gateway errors.
+status/retry metadata on non-JSON gateway errors, and rejection of non-object
+JSON in successful reserve/extend/commit/event responses.
 The previous 94.16% line-coverage baseline fell below the repository requirement;
 `tarpaulin.toml` now enforces a 95% minimum without excluding source files.
 Stable/MSRV tests, durable recovery conformance, coverage, and cargo audit
