@@ -1,5 +1,9 @@
 # Protocol Conformance Audit — Rust Client
 
+## 2026-10-14 — Dependency maintenance
+
+Dependabot PR #100 updates the SHA-pinned CodeQL SARIF uploader to 4.38.3 and includes current main. SDK source and protocol fixtures are unchanged. UUID 1.27.0 PR #99 is declined because it requires Rust 1.89 while this client declares and tests Rust 1.88. Both supported Rust toolchain checks and durable recovery conformance must pass before merge; coverage gates remain enabled.
+
 ## 2026-09-24 — Dependency maintenance
 
 Consolidates Dependabot PRs #92 and #91: the async-openai development
