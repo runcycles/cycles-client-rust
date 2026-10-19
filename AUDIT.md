@@ -1,5 +1,18 @@
 # Protocol Conformance Audit — Rust Client
 
+## 2026-10-19 — Dependabot dependency review
+
+Consolidates the following reviewed updates on current main:
+
+- PR #104: fix(deps): bump proptest from 1.11.0 to 1.12.0
+- PR #106: fix(deps): bump github/codeql-action/upload-sarif from 4.38.3 to 4.39.0
+- PR #107: fix(deps): bump ossf/scorecard-action from 2.4.4 to 2.5.0
+
+Workflow actions remain pinned to verified upstream commit SHAs. Existing supported runtime versions, application code, and YAML protocol contracts are preserved. Existing lint, build, test, coverage, conformance, and applicable security checks must pass on the combined commit before merge; coverage requirements are not lowered.
+
+Also updates locked quinn-proto to 0.11.18 and rustls to 0.23.46 to resolve the nine RustSec findings in the dependency PR audit (RUSTSEC-2026-0338 through 0342 and 0346 through 0349). UUID PR #103 is declined because UUID 1.28.0 requires Rust 1.89; this client retains its declared Rust 1.88 minimum and UUID 1.26.1.
+
+
 ## 2026-10-14 — Dependency maintenance
 
 Dependabot PR #100 updates the SHA-pinned CodeQL SARIF uploader to 4.38.3 and includes current main. SDK source and protocol fixtures are unchanged. UUID 1.27.0 PR #99 is declined because it requires Rust 1.89 while this client declares and tests Rust 1.88. Both supported Rust toolchain checks and durable recovery conformance must pass before merge; coverage gates remain enabled.
