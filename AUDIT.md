@@ -10,6 +10,8 @@ Consolidates the following reviewed updates on current main:
 
 Workflow actions remain pinned to verified upstream commit SHAs. Existing supported runtime versions, application code, and YAML protocol contracts are preserved. Existing lint, build, test, coverage, conformance, and applicable security checks must pass on the combined commit before merge; coverage requirements are not lowered.
 
+Also updates locked quinn-proto to 0.11.18 and rustls to 0.23.46 to resolve the nine RustSec findings in the dependency PR audit (RUSTSEC-2026-0338 through 0342 and 0346 through 0349). UUID PR #103 is declined because UUID 1.28.0 requires Rust 1.89; this client retains its declared Rust 1.88 minimum and UUID 1.26.1.
+
 
 ## 2026-10-14 — Dependency maintenance
 
