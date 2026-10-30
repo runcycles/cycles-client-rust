@@ -1,5 +1,17 @@
 # Protocol Conformance Audit — Rust Client
 
+## 2026-10-30 — Dependabot Tokio and lockfile security review
+
+PR #110 updates Tokio from 1.53.3 to 1.54.1. The client retains its declared
+Rust 1.88 minimum (Tokio 1.54 requires Rust 1.85). The lockfile also updates
+ctutils to 0.4.4, rustls-webpki to 0.103.16, webpki-root-certs to 1.0.10,
+and webpki-roots to 1.0.10, addressing RUSTSEC-2026-0385, -0382, -0383,
+and -0381 respectively, which blocked the original PR's cargo audit.
+
+Runtime source and authoritative YAML protocol contracts are unchanged.
+Rust stable/MSRV tests, durable recovery conformance, cargo audit, and the
+existing 95% coverage gate must pass on this updated commit before merge.
+
 ## 2026-10-19 — Dependabot dependency review
 
 Consolidates the following reviewed updates on current main:
