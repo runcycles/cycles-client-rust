@@ -1,5 +1,11 @@
 # Protocol Conformance Audit — Rust Client
 
+## 2026-11-11 - Dependabot dependency review
+
+PR #113 updates the async-openai development/example dependency from 0.42.2 to 0.43.0. Updates locked Hyper from 1.8.1 to 1.12.0 and want from 0.3.1 to 0.3.2 to remove unmaintained pin-utils (RUSTSEC-2026-0441), which blocked cargo audit --deny warnings. Cargo also normalizes Windows dependency edges without changing their package versions. Hyper 1.12.0 declares Rust 1.63 minimum; the client retains Rust 1.88. Stable/MSRV tests, example compilation, durable recovery conformance, coverage, and the unchanged strict audit must pass before merge.
+
+Includes current main. Application source and authoritative YAML contracts are unchanged. Existing test, coverage (at least 95% lines), conformance, and security gates remain enabled and must pass before merge.
+
 ## 2026-10-30 — Dependabot Tokio and lockfile security review
 
 PR #110 updates Tokio from 1.53.3 to 1.54.1. The client retains its declared
