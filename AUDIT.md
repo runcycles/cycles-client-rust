@@ -1,5 +1,19 @@
 # Protocol Conformance Audit — Rust Client
 
+## 2026-11-16 — Rust 1.88 compatibility and QUIC security maintenance (PR #115)
+
+Retains UUID 1.26.1 and bounds its dependency range below 1.27: upstream UUID
+1.27 through 1.29.2 require Rust 1.89, while this SDK declares and tests Rust
+1.88. The proposed UUID update is therefore replaced with a compatible
+dependency maintenance change rather than raising the supported minimum.
+
+Updates locked quinn-proto to 0.11.19 and quinn-udp to 0.5.16, the patched
+versions for RUSTSEC-2026-0523, RUSTSEC-2026-0524, and RUSTSEC-2026-0538.
+Both patched releases declare Rust 1.85 support. Application source and
+authoritative YAML contracts are unchanged. Stable and Rust 1.88 tests,
+durable recovery conformance, cargo audit, and the existing 95% coverage
+gate must pass before merge.
+
 ## 2026-11-11 - Dependabot dependency review
 
 PR #113 updates the async-openai development/example dependency from 0.42.2 to 0.43.0. Updates locked Hyper from 1.8.1 to 1.12.0 and want from 0.3.1 to 0.3.2 to remove unmaintained pin-utils (RUSTSEC-2026-0441), which blocked cargo audit --deny warnings. Also updates locked rustix from 1.1.4 to 1.1.6, the patched release for RUSTSEC-2026-0486 (unsound zero-length extended-attribute buffer handling), identified by the refreshed audit database. Cargo also normalizes Windows dependency edges without changing their package versions. Hyper 1.12.0 declares Rust 1.63 minimum; the client retains Rust 1.88. Stable/MSRV tests, example compilation, durable recovery conformance, coverage, and the unchanged strict audit must pass before merge.
