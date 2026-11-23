@@ -1,5 +1,11 @@
 # Protocol Conformance Audit — Rust Client
 
+## 2026-11-23 — Dependency review
+
+PR #116 updates the Scorecard action to its verified upstream v2.6.0 commit (`23f22cd`). The Rust 1.88 CI job for PR #117 rejected `uuid` 1.29.3 because it requires Rust 1.89. The SDK keeps its existing `uuid` constraint and locked version 1.26.1.
+
+The same PR's security audit identified `url` 2.5.8 in the existing dependency tree. The lockfile updates `url` to 2.5.9, the patched version for [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592.html), and `form_urlencoded` to 1.2.3. Cargo 1.88 resolved the updated lockfile.
+
 ## 2026-11-16 — Rust 1.88 compatibility and QUIC security maintenance (PR #115)
 
 Retains UUID 1.26.1 and bounds its dependency range below 1.27: upstream UUID
